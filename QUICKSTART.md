@@ -12,12 +12,16 @@
 - **Range**: 0.0 (deterministic) to 2.0 (highly random)
 - **Default**: 0.7 (balanced)
 
-### ✅ 3. Multiple Model Support
-- **Supported Models**:
-  - Phi-3: `microsoft/Phi-3-mini-4k-instruct`
-  - Phi-4: `microsoft/Phi-4`
-  - Llama-3.1: `meta-llama/Meta-Llama-3.1-8B-Instruct`
-  - Qwen: `Qwen/Qwen2.5-7B-Instruct`
+### ✅ 3. Multiple Model Support with Reasoning Capabilities
+- **Supported Models** (all with reasoning):
+  - **Qwen 2.5**: `Qwen/Qwen2.5-7B-Instruct` (default)
+  - **Llama-3.1**: `meta-llama/Meta-Llama-3.1-8B-Instruct`
+  - **Phi-4**: `microsoft/Phi-4` (when available)
+
+### ✅ 4. Modern Architecture
+- Uses `tokenizer.apply_chat_template()` for model-agnostic prompt formatting
+- Easy to switch between any chat-based models
+- Clean message format: `[{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]`
 
 ## Quick Usage
 
@@ -30,7 +34,7 @@ python main.py
 Edit `main.py`:
 ```python
 TEMPERATURE = 0.5
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"  # or use SUPPORTED_MODELS dict
 ```
 
 ### 3. Analyze generated outputs
@@ -109,23 +113,24 @@ search_logs(logs, "example", field='output')
 
 ## Model Differences
 
-### Phi-3 (microsoft/Phi-3-mini-4k-instruct)
-- **Size**: 3.8B parameters
-- **Context**: 4K tokens
-- **Strengths**: Fast, efficient, good instruction following
+### Qwen 2.5 (Qwen/Qwen2.5-7B-Instruct) ⭐ DEFAULT
+- **Size**: 7B parameters
+- **Context**: 32K tokens
+- **Strengths**: Strong reasoning, multilingual, excellent instruction following
+- **Memory**: ~16GB VRAM
+
+### Llama-3.1 (meta-llama/Meta-Llama-3.1-8B-Instruct)
+- **Size**: 8B parameters
+- **Context**: 128K tokens
+- **Strengths**: Outstanding instruction following, strong reasoning, long context
+- **Memory**: ~18GB VRAM
+- **Note**: May require HuggingFace authentication
 
 ### Phi-4 (microsoft/Phi-4)
 - **Size**: TBD
 - **Strengths**: Enhanced reasoning capabilities
-
-### Llama-3.1 (meta-llama/Meta-Llama-3.1-8B-Instruct)
-- **Size**: 8B parameters
-- **Context**: 8K tokens
-- **Strengths**: Strong general performance, good instruction following
-
-### Qwen (Qwen/Qwen2.5-7B-Instruct)
-- **Size**: 7B parameters
-- **Strengths**: Multilingual, strong reasoning
+- **Memory**: ~12GB VRAM (estimated)
+- **Note**: Check availability on HuggingFace
 
 ## Tips
 

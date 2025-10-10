@@ -10,11 +10,9 @@ from datetime import datetime
 
 # Experiment configurations
 MODELS_TO_TEST = [
-    "microsoft/Phi-3-mini-4k-instruct",
     "Qwen/Qwen2.5-7B-Instruct",
-    # Uncomment if you have access:
-    # "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    # "microsoft/Phi-4",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    # "microsoft/Phi-4",  # Uncomment when available/accessible
 ]
 
 TEMPERATURES = [0.3, 0.7, 1.0]

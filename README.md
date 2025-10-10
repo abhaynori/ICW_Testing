@@ -5,7 +5,8 @@ This repository implements and evaluates various Instruction-based Content Water
 ## Features
 
 - **Multiple ICW Strategies**: Unicode, Initials, Lexical, and Acrostics watermarking
-- **Multi-Model Support**: Phi-3, Phi-4, Llama-3.1, Qwen
+- **Multi-Model Support**: Qwen-2.5, Llama-3.1, Phi-4 (all with reasoning capabilities)
+- **Flexible Architecture**: Uses `tokenizer.apply_chat_template()` for easy model switching
 - **Configurable Temperature**: Control generation randomness
 - **Comprehensive Logging**: All prompts and outputs saved to JSONL files
 - **Evaluation Metrics**: ROC-AUC and T@1%FPR
@@ -29,19 +30,24 @@ MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"  # Choose from SUPPORTED_MODELS
 
 ### Supported Models
 
+**All models have reasoning capabilities:**
+
 ```python
 SUPPORTED_MODELS = {
-    "phi-3": "microsoft/Phi-3-mini-4k-instruct",
-    "phi-4": "microsoft/Phi-4",
-    "llama-3.1": "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    "qwen": "Qwen/Qwen2.5-7B-Instruct"
+    "qwen-2.5": "Qwen/Qwen2.5-7B-Instruct",      # 7B, multilingual, strong reasoning
+    "llama-3.1": "meta-llama/Meta-Llama-3.1-8B-Instruct",  # 8B, excellent instruction following
+    "phi-4": "microsoft/Phi-4",                   # Enhanced reasoning (when available)
 }
 ```
 
 To change models, simply update `MODEL_NAME`:
 ```python
-MODEL_NAME = SUPPORTED_MODELS["qwen"]  # Use Qwen model
+MODEL_NAME = SUPPORTED_MODELS["llama-3.1"]  # Use Llama-3.1 model
+# Or directly:
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 ```
+
+**Note**: The code uses `tokenizer.apply_chat_template()` which makes it easy to switch between any chat-based models without changing prompt formatting.
 
 ### Temperature Settings
 
