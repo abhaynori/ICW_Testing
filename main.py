@@ -8,17 +8,58 @@ from nltk import pos_tag, word_tokenize
 from nltk.tokenize import sent_tokenize
 import Levenshtein
 from sentence_transformers import SentenceTransformer, util
+import json
+from datetime import datetime
+import os
 
 nltk.download('averaged_perceptron_tagger', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 
-# Model setup
-model_name = "microsoft/Phi-3-mini-4k-instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, device_map="auto")
+# Configuration
+TEMPERATURE = 0.7  # Adjustable temperature parameter
+MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"  # Can be changed to other models
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Generation pipeline with deterministic settings
-generator = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=200, do_sample=False, temperature=0.0)
+# Supported models
+SUPPORTED_MODELS = {
+    "phi-3": "microsoft/Phi-3-mini-4k-instruct",
+    "phi-4": "microsoft/Phi-4",  # Update when available
+    "llama-3.1": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "qwen": "Qwen/Qwen2.5-7B-Instruct"
+}
+
+# Model setup
+print(f"Loading model: {MODEL_NAME}")
+print(f"Temperature: {TEMPERATURE}")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto")
+
+# Generation pipeline with configurable temperature
+do_sample = TEMPERATURE > 0
+generator = pipeline(
+    "text-generation", 
+    model=model, 
+    tokenizer=tokenizer, 
+    max_new_tokens=200, 
+    do_sample=do_sample, 
+    temperature=TEMPERATURE if do_sample else None
+)
+
+# Logging function
+def log_generation(query, prompt, output, method, filename="generation_log.jsonl"):
+    log_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "method": method,
+        "model": MODEL_NAME,
+        "temperature": TEMPERATURE,
+        "query": query,
+        "prompt": prompt,
+        "output": output
+    }
+    with open(os.path.join(OUTPUT_DIR, filename), "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
+    return log_entry
 
 # Dataset (small subset for demo; increase as needed)
 eli5 = load_dataset("sentence-transformers/eli5", "pair", split="train")["question"][:10]
@@ -33,10 +74,21 @@ def unicode_embed_prompt(query):
     return format_phi_prompt(instruction, query)
 
 unicode_watermarked = []
-for query in eli5:
+print("\n=== Unicode ICW Generation ===")
+for i, query in enumerate(eli5):
     prompt = unicode_embed_prompt(query)
     output = generator(prompt)[0]['generated_text']
-    unicode_watermarked.append(output.split('<|assistant|>')[-1].strip())  # Extract response
+    response = output.split('<|assistant|>')[-1].strip()
+    unicode_watermarked.append(response)
+    
+    # Log to file
+    log_generation(query, prompt, response, "Unicode ICW")
+    
+    # Print first 2 examples to console
+    if i < 2:
+        print(f"\nExample {i+1}:")
+        print(f"Query: {query}")
+        print(f"Response: {response[:200]}...")  # Print first 200 chars
 
 def unicode_detector(text, threshold=0.8):
     zwsp = '\u200b'
@@ -52,10 +104,21 @@ def initials_embed_prompt(query):
     return format_phi_prompt(instruction, query)
 
 initials_watermarked = []
-for query in eli5:
+print("\n=== Initials ICW Generation ===")
+for i, query in enumerate(eli5):
     prompt = initials_embed_prompt(query)
     output = generator(prompt)[0]['generated_text']
-    initials_watermarked.append(output.split('<|assistant|>')[-1].strip())
+    response = output.split('<|assistant|>')[-1].strip()
+    initials_watermarked.append(response)
+    
+    # Log to file
+    log_generation(query, prompt, response, "Initials ICW")
+    
+    # Print first 2 examples to console
+    if i < 2:
+        print(f"\nExample {i+1}:")
+        print(f"Query: {query}")
+        print(f"Response: {response[:200]}...")
 
 def initials_detector(text, green_letters, gamma=0.5):
     words = text.lower().split()
@@ -73,10 +136,21 @@ def lexical_embed_prompt(query):
     return format_phi_prompt(instruction, query)
 
 lexical_watermarked = []
-for query in eli5:
+print("\n=== Lexical ICW Generation ===")
+for i, query in enumerate(eli5):
     prompt = lexical_embed_prompt(query)
     output = generator(prompt)[0]['generated_text']
-    lexical_watermarked.append(output.split('<|assistant|>')[-1].strip())
+    response = output.split('<|assistant|>')[-1].strip()
+    lexical_watermarked.append(response)
+    
+    # Log to file
+    log_generation(query, prompt, response, "Lexical ICW")
+    
+    # Print first 2 examples to console
+    if i < 2:
+        print(f"\nExample {i+1}:")
+        print(f"Query: {query}")
+        print(f"Response: {response[:200]}...")
 
 def lexical_detector(text, green_words, gamma=0.1):
     tokens = word_tokenize(text.lower())
@@ -95,10 +169,21 @@ def acrostics_embed_prompt(query):
     return format_phi_prompt(instruction, query)
 
 acrostics_watermarked = []
-for query in eli5:
+print("\n=== Acrostics ICW Generation ===")
+for i, query in enumerate(eli5):
     prompt = acrostics_embed_prompt(query)
     output = generator(prompt)[0]['generated_text']
-    acrostics_watermarked.append(output.split('<|assistant|>')[-1].strip())
+    response = output.split('<|assistant|>')[-1].strip()
+    acrostics_watermarked.append(response)
+    
+    # Log to file
+    log_generation(query, prompt, response, "Acrostics ICW")
+    
+    # Print first 2 examples to console
+    if i < 2:
+        print(f"\nExample {i+1}:")
+        print(f"Query: {query}")
+        print(f"Response: {response[:200]}...")
 
 def acrostics_detector(text, secret_sequence):
     sentences = sent_tokenize(text)
