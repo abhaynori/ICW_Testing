@@ -6,19 +6,21 @@ from sklearn.metrics import roc_auc_score, roc_curve
 import nltk
 from nltk import pos_tag, word_tokenize
 from nltk.tokenize import sent_tokenize
+import Levenshtein
 import json
 from datetime import datetime
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
+import warnings
 
 nltk.download('averaged_perceptron_tagger', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 
 # ===== CONFIGURATION =====
-MEMORY_STRATEGY = "small"  # Optimized for Apple Silicon
-TEMPERATURE = 0.7  # Higher temperature for more natural variation
-NUM_SAMPLES = 50  # Increased from 10 for more reliable statistics
+MEMORY_STRATEGY = "small"  # Options: "small" (1.5B), "4bit" (7B), "8bit" (7B), "full" (7B)
+TEMPERATURE = 0.7
+NUM_SAMPLES = 50  # Increase to 200+ for more reliable statistics
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -28,12 +30,24 @@ config = get_model_config(MEMORY_STRATEGY)
 MODEL_NAME = config["model_name"]
 
 print(f"\n{'='*80}")
-print(f"ICW WATERMARKING EVALUATION")
+print(f"ICW WATERMARKING EVALUATION (Paper-Accurate Implementation)")
 print(f"{'='*80}")
 print(f"Memory Strategy: {MEMORY_STRATEGY}")
 print(f"Model: {MODEL_NAME}")
 print(f"Temperature: {TEMPERATURE}")
 print(f"Samples: {NUM_SAMPLES}")
+print(f"{'='*80}")
+
+# Warning for small models
+if "1.5B" in MODEL_NAME or "1.5b" in MODEL_NAME:
+    print(f"\n⚠️  WARNING: Using a 1.5B model")
+    print(f"   The paper shows that even GPT-4o-mini struggles with some ICW methods.")
+    print(f"   Expected results:")
+    print(f"   - Unicode ICW: Will likely fail (model can't insert actual Unicode)")
+    print(f"   - Initials ICW: Will likely fail (requires strong instruction-following)")
+    print(f"   - Lexical ICW: Will likely fail (can't track 36-word list)")
+    print(f"   - Acrostics ICW: May show weak signal (easiest task)")
+    print(f"\n   For better results, use MEMORY_STRATEGY='4bit' for 7B model")
 print(f"{'='*80}\n")
 
 # Load model and tokenizer
@@ -100,16 +114,15 @@ eli5 = load_dataset("sentence-transformers/eli5", "pair", split="train")["questi
 print(f"✓ Loaded {len(eli5)} questions\n")
 
 # ============================================================================
-# WATERMARKING STRATEGIES
+# WATERMARKING STRATEGIES (Paper-Accurate)
 # ============================================================================
 
-# --- 1. Unicode ICW (Exclamation Points) ---
+# --- 1. Unicode ICW ---
 def unicode_embed_prompt(query):
-    """Prompt for Unicode watermarking using exclamation points."""
+    """Paper prompt: Insert zero-width space (U+200B) after every word."""
     system_msg = (
-        "Follow this formatting rule STRICTLY: Place an exclamation mark (!) after EVERY single word. "
-        "Example: 'The! sky! is! blue!' "
-        "Write a detailed explanation with 5-8 sentences. Every word must end with !."
+        "You are an adaptive language model. In the following conversation, "
+        "please insert a zero-width space Unicode (U+200B) after every word in your response."
     )
     return [
         {"role": "system", "content": system_msg},
@@ -117,127 +130,158 @@ def unicode_embed_prompt(query):
     ]
 
 def unicode_detector(text):
-    """Detect exclamation point pattern (FIXED VERSION)."""
-    tokens = text.split()
-    if len(tokens) < 5:
+    """
+    Paper detector: D(y|ku,τu) := |y|ku / N
+    where |y|ku = number of inserted Unicode characters
+    and N = total number of words
+    """
+    unicode_count = text.count('\u200B')
+    words = text.split()
+    N = len(words)
+    
+    if N == 0:
         return 0
     
-    tokens_with_exclamation = sum(1 for token in tokens if token.endswith('!'))
-    n = len(tokens)
-    
-    # Natural text: ~1.5% of words end with !
-    p_natural = 0.015
-    
-    # Binomial test
-    observed = tokens_with_exclamation
-    expected = n * p_natural
-    std = np.sqrt(n * p_natural * (1 - p_natural))
-    
-    if std == 0:
-        return 0
-    
-    z_score = (observed - expected) / std
-    return z_score
+    return unicode_count / N
 
-# --- 2. Initials ICW (Vowel Preference) ---
-green_letters = set('aeiou')
+# --- 2. Initials ICW ---
+# Canterbury Corpus letter frequencies (initial letter probabilities)
+CANTERBURY_FREQUENCIES = {
+    'a': 0.0856, 'b': 0.0139, 'c': 0.0254, 'd': 0.0387, 'e': 0.1270,
+    'f': 0.0289, 'g': 0.0199, 'h': 0.0528, 'i': 0.0627, 'j': 0.0013,
+    'k': 0.0042, 'l': 0.0339, 'm': 0.0254, 'n': 0.0710, 'o': 0.0797,
+    'p': 0.0199, 'q': 0.0012, 'r': 0.0677, 's': 0.0607, 't': 0.1045,
+    'u': 0.0243, 'v': 0.0105, 'w': 0.0169, 'x': 0.0017, 'y': 0.0143,
+    'z': 0.0008
+}
+
+green_letters = set('abcdefghijklm')
 
 def initials_embed_prompt(query):
-    """Prompt for Initials watermarking."""
+    """Paper prompt: Maximize words starting with green letters."""
+    green_list = ', '.join(sorted(green_letters))
+    red_list = ', '.join(sorted(set('nopqrstuvwxyz')))
+    
     system_msg = (
-        f"Writing guideline: Try to start as many words as possible with these letters: {', '.join(sorted(green_letters))}. "
-        f"Be natural and informative. Write 5-8 sentences. Don't mention this guideline."
+        f"### Green Letter List: {green_list}\n"
+        f"### Red Letter List: {red_list}\n\n"
+        "### Command:\n"
+        "You are provided a Green Letter List and a Red Letter List. For each user query, generate a response that is:\n"
+        "1. Clear & Coherent: Easy to follow and logically organized.\n"
+        "2. Accurate & Concrete: Provides precise facts, examples, or steps.\n"
+        "3. Contextually Relevant: Directly addresses the user's intent and context.\n"
+        "4. 'Green Letter' Enriched (Most Important!): Try to increase the use of words beginning "
+        "with letters from the Green List and reduce the use of words that start with letters from the Red List."
     )
     return [
         {"role": "system", "content": system_msg},
         {"role": "user", "content": query}
     ]
 
-def initials_detector(text, green_letters, gamma=None):
-    """Detect initials watermark (FIXED VERSION)."""
+def initials_detector(text, green_letters):
+    """
+    Paper detector: D(y|kc,τc) := (|y|G - γ|y|) / sqrt(γ(1-γ)|y|)
+    where γ = sum of P_A(a) for a in green_letters
+    """
     words = [w for w in text.lower().split() if w and w[0].isalpha()]
     
-    if len(words) < 5:
+    if len(words) == 0:
         return 0
     
-    green_count = sum(w[0] in green_letters for w in words)
+    green_count = sum(1 for w in words if w[0] in green_letters)
+    gamma = sum(CANTERBURY_FREQUENCIES.get(letter, 0) for letter in green_letters)
+    
     n = len(words)
+    numerator = green_count - gamma * n
+    denominator = np.sqrt(gamma * (1 - gamma) * n)
     
-    # Empirical vowel frequency in English word initials (~38%)
-    if gamma is None:
-        gamma = 0.38
-    
-    # Binomial test
-    expected = n * gamma
-    std = np.sqrt(n * gamma * (1 - gamma))
-    
-    if std == 0:
+    if denominator == 0:
         return 0
     
-    z_score = (green_count - expected) / std
+    z_score = numerator / denominator
     return z_score
 
-# --- 3. Lexical ICW (Preferred Words) ---
+# --- 3. Lexical ICW ---
 green_words = set([
     'amazing', 'beautiful', 'bright', 'brilliant', 'excellent', 'fantastic',
     'great', 'happy', 'incredible', 'joyful', 'magnificent', 'outstanding',
     'perfect', 'quick', 'radiant', 'splendid', 'superb', 'terrific',
     'unique', 'vibrant', 'wonderful', 'enable', 'enhance', 'improve',
-    'increase', 'optimize', 'strengthen', 'utilize', 'achieve', 'create'
+    'increase', 'optimize', 'strengthen', 'utilize', 'achieve', 'create',
+    'develop', 'facilitate', 'implement', 'integrate', 'maximize', 'promote'
 ])
 
+VOCAB_SIZE = 10857  # Full vocabulary size from paper
+gamma_lexical = len(green_words) / VOCAB_SIZE
+
 def lexical_embed_prompt(query):
-    """Prompt for Lexical watermarking."""
-    word_list = ', '.join(sorted(list(green_words))[:15])  # Show subset
+    """Paper prompt: Maximize use of words from green word list."""
+    word_list = ', '.join(sorted(list(green_words)))
+    
     system_msg = (
-        f"Writing style: Prefer using descriptive words like: {word_list}, and similar positive adjectives/verbs. "
-        f"Write naturally and informatively with 5-8 sentences."
+        f"### Green Word List: {word_list}\n\n"
+        "### Command:\n"
+        "You are given a predefined Green Word List. For each user query, generate a response that is:\n"
+        "1. Clear & Coherent: Easy to follow and logically organized.\n"
+        "2. Accurate & Concrete: Provides precise facts, examples, or steps.\n"
+        "3. Contextually Relevant: Directly addresses the user's intent and context.\n"
+        "4. 'Green Word' Enriched (Most Important!): Try your best to seamlessly incorporate as many "
+        "words from the Green Word List as possible — without compromising text quality."
     )
     return [
         {"role": "system", "content": system_msg},
         {"role": "user", "content": query}
     ]
 
-def lexical_detector(text, green_words, gamma=None):
-    """Detect lexical watermark (FIXED VERSION)."""
+def lexical_detector(text, green_words):
+    """
+    Paper detector: D(y|kL,τL) := (|y|G - γ|y|) / sqrt(γ(1-γ)|y|)
+    CRITICAL: Filter to adjectives, adverbs, verbs BEFORE counting
+    """
     tokens = word_tokenize(text.lower())
     tagged = pos_tag(tokens)
     
-    # Filter to adjectives, adverbs, verbs
     candidates = [word for word, tag in tagged 
                   if (tag.startswith('JJ') or tag.startswith('RB') or tag.startswith('VB'))
                   and word.isalpha()]
     
-    if len(candidates) < 5:
+    if len(candidates) == 0:
         return 0
     
-    green_count = sum(word in green_words for word in candidates)
+    green_count = sum(1 for word in candidates if word in green_words)
     n = len(candidates)
+    gamma = gamma_lexical
     
-    # Estimate gamma: green words as fraction of all descriptive words
-    if gamma is None:
-        # Conservative: assume green words are 2% of descriptive vocabulary
-        gamma = 0.02
+    numerator = green_count - gamma * n
+    denominator = np.sqrt(gamma * (1 - gamma) * n)
     
-    # Binomial test
-    expected = n * gamma
-    std = np.sqrt(n * gamma * (1 - gamma))
-    
-    if std == 0:
+    if denominator == 0:
         return 0
     
-    z_score = (green_count - expected) / std
+    z_score = numerator / denominator
     return z_score
 
-# --- 4. Acrostics ICW (SECRET Pattern) ---
+# --- 4. Acrostics ICW ---
 secret_sequence = "SECRET"
 
 def acrostics_embed_prompt(query):
-    """Prompt for Acrostics watermarking."""
+    """Paper prompt: Structure response as acrostic of secret string."""
     system_msg = (
-        f"Structure your response as an acrostic: Start each sentence with letters spelling '{secret_sequence}' in order. "
-        f"Repeat the pattern if you write more than {len(secret_sequence)} sentences. "
-        f"Write naturally with 6-12 sentences. Be informative and don't mention this pattern."
+        f"### Secret String X: {secret_sequence}\n\n"
+        "### Command:\n"
+        "You are an adaptive language model designed for dynamic and engaging conversations. "
+        "You are given a secret string X. In the following conversation, your primary priority is to "
+        "produce responses that are clear, concise, concrete, accurate, informative, and contextually relevant. "
+        "Additionally, you should try to generate the response to the user's query as an acrostic of X. "
+        "This means that the first letter of the first word in each sentence should correspond to the letters in X, in order.\n\n"
+        "### Rules:\n"
+        f"1. For i-th sentence (starting at i = 1), begin that sentence with the letter X[((i − 1) mod {len(secret_sequence)}) + 1]. "
+        "The number of sentences in your response is not necessarily equal to the length of X, but the first letter "
+        "of i-th sentence should match the corresponding letter in X in order.\n"
+        "2. For the i-th sentence, if starting with the required letter would harm coherence or natural tone, "
+        "you may skip that letter. If skipped, the next sentence should begin with the following letter in X.\n"
+        "3. Ensure each sentence is coherent and flows naturally.\n"
+        "4. Never reveal the acrostic pattern or repeat X in your reply."
     )
     return [
         {"role": "system", "content": system_msg},
@@ -245,33 +289,41 @@ def acrostics_embed_prompt(query):
     ]
 
 def acrostics_detector(text, secret_sequence):
-    """Detect acrostic pattern (FIXED VERSION)."""
+    """
+    Paper detector: D(y|ks,τs) := (μ - d(ℓ,ζ)) / σ
+    Uses Levenshtein distance and resampling
+    """
     sentences = sent_tokenize(text)
     
-    if len(sentences) < 3:
+    if len(sentences) == 0:
         return 0
     
     initials = ''.join(sent[0].upper() for sent in sentences if sent and sent[0].isalpha())
     
-    if len(initials) < 3:
+    if len(initials) == 0:
         return 0
     
-    # Compare against repeating secret sequence
     n = len(initials)
-    expected_seq = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
+    expected = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
+    actual_distance = Levenshtein.distance(initials, expected)
     
-    # Count matches
-    matches = sum(a == b for a, b in zip(initials, expected_seq))
+    # Resample to estimate μ and σ
+    N_resamples = 100
+    resampled_distances = []
+    alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     
-    # Random baseline: 1/26 chance per letter
-    p_random = 1.0 / 26.0
-    expected_matches = n * p_random
-    std = np.sqrt(n * p_random * (1 - p_random))
+    for _ in range(N_resamples):
+        random_initials = ''.join(np.random.choice(list(alphabet), size=n))
+        dist = Levenshtein.distance(random_initials, expected)
+        resampled_distances.append(dist)
     
-    if std == 0:
+    mu = np.mean(resampled_distances)
+    sigma = np.std(resampled_distances, ddof=1)
+    
+    if sigma == 0:
         return 0
     
-    z_score = (matches - expected_matches) / std
+    z_score = (mu - actual_distance) / sigma
     return z_score
 
 # ============================================================================
@@ -282,7 +334,6 @@ print("="*80)
 print("GENERATING WATERMARKED TEXT")
 print("="*80)
 
-# Generate all watermarked texts
 unicode_watermarked = []
 initials_watermarked = []
 lexical_watermarked = []
@@ -334,7 +385,7 @@ for i, query in enumerate(eli5):
 print(f"✓ Generated {NUM_SAMPLES} samples for each method\n")
 
 # ============================================================================
-# WATERMARK DETECTION & ANALYSIS
+# COMPLIANCE ANALYSIS
 # ============================================================================
 
 def analyze_watermark_compliance(texts, detector, detector_args, method_name):
@@ -343,107 +394,124 @@ def analyze_watermark_compliance(texts, detector, detector_args, method_name):
     print(f"{method_name} - Compliance Analysis")
     print(f"{'='*80}")
     
-    # Show first 3 examples
     for i in range(min(3, len(texts))):
         print(f"\nExample {i+1}:")
         print(f"Text: {texts[i][:200]}...")
         
-        # Method-specific analysis
         if "Unicode" in method_name:
-            tokens = texts[i].split()
-            excl_count = sum(1 for t in tokens if t.endswith('!'))
-            ratio = excl_count / len(tokens) if tokens else 0
-            print(f"  Tokens: {len(tokens)}, With !: {excl_count}, Ratio: {ratio:.1%}")
-            print(f"  Expected: ~95-100% for perfect watermark")
+            unicode_count = texts[i].count('\u200B')
+            words = len(texts[i].split())
+            ratio = unicode_count / words if words > 0 else 0
+            print(f"  Words: {words}, Zero-width spaces: {unicode_count}, Ratio: {ratio:.1%}")
+            print(f"  Expected: ~100% for perfect watermark")
+            
+            # Check if model is writing "U+200B" as text
+            if 'U+200B' in texts[i] or 'u200b' in texts[i].lower():
+                print(f"  ⚠️  Model is writing 'U+200B' as text instead of inserting Unicode!")
         
         elif "Initials" in method_name:
             words = [w for w in texts[i].lower().split() if w and w[0].isalpha()]
-            vowel_count = sum(1 for w in words if w[0] in green_letters)
-            ratio = vowel_count / len(words) if words else 0
-            print(f"  Words: {len(words)}, Vowel starts: {vowel_count}, Ratio: {ratio:.1%}")
-            print(f"  Expected: >50% for watermark, ~38% for natural")
+            green_count = sum(1 for w in words if w[0] in green_letters)
+            gamma = sum(CANTERBURY_FREQUENCIES.get(letter, 0) for letter in green_letters)
+            ratio = green_count / len(words) if words else 0
+            print(f"  Words: {len(words)}, Green initials: {green_count}, Ratio: {ratio:.1%}")
+            print(f"  Expected: >{gamma*100:.1f}% for watermark (natural baseline ~{gamma*100:.1f}%)")
+            
+            if ratio < gamma * 1.1:  # Less than 10% improvement
+                print(f"  ⚠️  No significant increase in green letters - watermark not applied")
         
         elif "Lexical" in method_name:
             tokens = word_tokenize(texts[i].lower())
-            green_found = [t for t in tokens if t in green_words]
-            print(f"  Green words used: {green_found[:5]}")
-            print(f"  Count: {len(green_found)}")
+            tagged = pos_tag(tokens)
+            candidates = [w for w, t in tagged if (t.startswith('JJ') or t.startswith('RB') or t.startswith('VB')) and w.isalpha()]
+            green_found = [w for w in candidates if w in green_words]
+            print(f"  Candidate words (JJ/RB/VB): {len(candidates)}")
+            print(f"  Green words found: {len(green_found)}")
+            if green_found:
+                print(f"  Examples: {green_found[:5]}")
+            else:
+                print(f"  ⚠️  No green words found - model ignoring word list")
         
         elif "Acrostics" in method_name:
             sentences = sent_tokenize(texts[i])
             initials = ''.join(s[0].upper() for s in sentences if s and s[0].isalpha())
-            expected = (secret_sequence.upper() * (len(initials) // len(secret_sequence) + 1))[:len(initials)]
-            matches = sum(a == b for a, b in zip(initials, expected))
+            n = len(initials)
+            expected = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
+            distance = Levenshtein.distance(initials, expected)
+            matches = n - distance
             print(f"  Sentences: {len(sentences)}")
             print(f"  Initials: {initials}")
             print(f"  Expected: {expected}")
-            print(f"  Matches: {matches}/{len(initials)} ({matches/len(initials)*100:.0f}%)")
+            print(f"  Matches: {matches}/{n} ({matches/n*100:.0f}%)")
+            print(f"  Levenshtein distance: {distance}")
+            
+            if matches / n < 0.3:  # Less than 30% match
+                print(f"  ⚠️  Low match rate - watermark weakly applied")
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
 
 def evaluate_strategy(wm_texts, detector, detector_args, non_wm_texts, method_name):
-    """Evaluate watermarking strategy with detailed statistics."""
+    """Evaluate watermarking strategy."""
     
-    # Calculate scores
     wm_scores = [detector(text, *detector_args) for text in wm_texts]
     non_wm_scores = [detector(text, *detector_args) for text in non_wm_texts]
     
-    # Statistics
     print(f"\n{'='*80}")
     print(f"{method_name} - Detection Scores")
     print(f"{'='*80}")
     
-    print(f"\nWatermarked texts (n={len(wm_scores)}):")
-    print(f"  Mean:   {np.mean(wm_scores):7.3f}")
-    print(f"  Median: {np.median(wm_scores):7.3f}")
-    print(f"  Std:    {np.std(wm_scores):7.3f}")
-    print(f"  Range:  [{np.min(wm_scores):.3f}, {np.max(wm_scores):.3f}]")
-    print(f"  Q1-Q3:  [{np.percentile(wm_scores, 25):.3f}, {np.percentile(wm_scores, 75):.3f}]")
+    print(f"\nWatermarked (n={len(wm_scores)}):")
+    print(f"  Mean: {np.mean(wm_scores):7.3f}, Std: {np.std(wm_scores):7.3f}")
+    print(f"  Range: [{np.min(wm_scores):.3f}, {np.max(wm_scores):.3f}]")
     
-    print(f"\nNon-watermarked texts (n={len(non_wm_scores)}):")
-    print(f"  Mean:   {np.mean(non_wm_scores):7.3f}")
-    print(f"  Median: {np.median(non_wm_scores):7.3f}")
-    print(f"  Std:    {np.std(non_wm_scores):7.3f}")
-    print(f"  Range:  [{np.min(non_wm_scores):.3f}, {np.max(non_wm_scores):.3f}]")
-    print(f"  Q1-Q3:  [{np.percentile(non_wm_scores, 25):.3f}, {np.percentile(non_wm_scores, 75):.3f}]")
+    print(f"\nNon-watermarked (n={len(non_wm_scores)}):")
+    print(f"  Mean: {np.mean(non_wm_scores):7.3f}, Std: {np.std(non_wm_scores):7.3f}")
+    print(f"  Range: [{np.min(non_wm_scores):.3f}, {np.max(non_wm_scores):.3f}]")
     
     separation = np.mean(wm_scores) - np.mean(non_wm_scores)
-    pooled_std = np.sqrt((np.var(wm_scores) + np.var(non_wm_scores)) / 2)
-    cohens_d = separation / pooled_std if pooled_std > 0 else 0
+    print(f"\nSeparation: {separation:.3f}")
     
-    print(f"\nSeparation:")
-    print(f"  Mean difference: {separation:7.3f}")
-    print(f"  Cohen's d:       {cohens_d:7.3f} ", end="")
-    if abs(cohens_d) < 0.2:
-        print("(negligible)")
-    elif abs(cohens_d) < 0.5:
-        print("(small)")
-    elif abs(cohens_d) < 0.8:
-        print("(medium)")
+    # Interpretation
+    if separation < 0:
+        print(f"  ⚠️  Negative separation - watermark made scores WORSE")
+    elif separation < 0.5:
+        print(f"  ⚠️  Weak separation - watermark barely detectable")
+    elif separation < 1.0:
+        print(f"  ✓ Moderate separation - watermark detectable")
     else:
-        print("(large)")
+        print(f"  ✓✓ Strong separation - watermark easily detectable")
     
-    # ROC-AUC
     labels = [1] * len(wm_scores) + [0] * len(non_wm_scores)
     scores = wm_scores + non_wm_scores
     
     if len(set(scores)) < 2:
         print(f"\n⚠️  WARNING: All scores identical - ROC-AUC undefined")
-        return 0.5, 0.0
+        return 0.5, 0.0, 0.0
     
     auc = roc_auc_score(labels, scores)
-    fpr, tpr, thresholds = roc_curve(labels, scores)
+    fpr, tpr, _ = roc_curve(labels, scores)
     
-    # TPR at 1% FPR
     tpr_at_1fpr = tpr[np.where(fpr <= 0.01)[0][-1]] if any(fpr <= 0.01) else 0
-    
-    # TPR at 5% FPR
-    tpr_at_5fpr = tpr[np.where(fpr <= 0.05)[0][-1]] if any(fpr <= 0.05) else 0
+    tpr_at_10fpr = tpr[np.where(fpr <= 0.10)[0][-1]] if any(fpr <= 0.10) else 0
     
     print(f"\nMetrics:")
-    print(f"  ROC-AUC:    {auc:.4f}")
-    print(f"  TPR@1%FPR:  {tpr_at_1fpr:.4f}")
-    print(f"  TPR@5%FPR:  {tpr_at_5fpr:.4f}")
+    print(f"  ROC-AUC:     {auc:.4f}")
+    print(f"  TPR@1%FPR:   {tpr_at_1fpr:.4f}")
+    print(f"  TPR@10%FPR:  {tpr_at_10fpr:.4f}")
     
-    return auc, tpr_at_1fpr, tpr_at_5fpr
+    # Interpretation
+    if auc < 0.55:
+        print(f"  ⚠️  ROC-AUC near random - watermarking failed")
+    elif auc < 0.7:
+        print(f"  ⚠️  Low ROC-AUC - weak watermark")
+    elif auc < 0.9:
+        print(f"  ✓ Good ROC-AUC - detectable watermark")
+    else:
+        print(f"  ✓✓ Excellent ROC-AUC - strong watermark")
+    
+    return auc, tpr_at_1fpr, tpr_at_10fpr
 
 # ============================================================================
 # RUN EVALUATIONS
@@ -457,31 +525,31 @@ results = []
 
 # Unicode ICW
 analyze_watermark_compliance(unicode_watermarked, unicode_detector, (), "Unicode ICW")
-unicode_auc, unicode_t1, unicode_t5 = evaluate_strategy(
+unicode_auc, unicode_t1, unicode_t10 = evaluate_strategy(
     unicode_watermarked, unicode_detector, (), non_wm_texts, "Unicode ICW"
 )
-results.append({"Method": "Unicode ICW", "ROC-AUC": unicode_auc, "TPR@1%FPR": unicode_t1, "TPR@5%FPR": unicode_t5})
+results.append({"Method": "Unicode ICW", "ROC-AUC": unicode_auc, "TPR@1%FPR": unicode_t1, "TPR@10%FPR": unicode_t10})
 
 # Initials ICW
 analyze_watermark_compliance(initials_watermarked, initials_detector, (green_letters,), "Initials ICW")
-initials_auc, initials_t1, initials_t5 = evaluate_strategy(
+initials_auc, initials_t1, initials_t10 = evaluate_strategy(
     initials_watermarked, initials_detector, (green_letters,), non_wm_texts, "Initials ICW"
 )
-results.append({"Method": "Initials ICW", "ROC-AUC": initials_auc, "TPR@1%FPR": initials_t1, "TPR@5%FPR": initials_t5})
+results.append({"Method": "Initials ICW", "ROC-AUC": initials_auc, "TPR@1%FPR": initials_t1, "TPR@10%FPR": initials_t10})
 
 # Lexical ICW
 analyze_watermark_compliance(lexical_watermarked, lexical_detector, (green_words,), "Lexical ICW")
-lexical_auc, lexical_t1, lexical_t5 = evaluate_strategy(
+lexical_auc, lexical_t1, lexical_t10 = evaluate_strategy(
     lexical_watermarked, lexical_detector, (green_words,), non_wm_texts, "Lexical ICW"
 )
-results.append({"Method": "Lexical ICW", "ROC-AUC": lexical_auc, "TPR@1%FPR": lexical_t1, "TPR@5%FPR": lexical_t5})
+results.append({"Method": "Lexical ICW", "ROC-AUC": lexical_auc, "TPR@1%FPR": lexical_t1, "TPR@10%FPR": lexical_t10})
 
 # Acrostics ICW
 analyze_watermark_compliance(acrostics_watermarked, acrostics_detector, (secret_sequence,), "Acrostics ICW")
-acrostics_auc, acrostics_t1, acrostics_t5 = evaluate_strategy(
+acrostics_auc, acrostics_t1, acrostics_t10 = evaluate_strategy(
     acrostics_watermarked, acrostics_detector, (secret_sequence,), non_wm_texts, "Acrostics ICW"
 )
-results.append({"Method": "Acrostics ICW", "ROC-AUC": acrostics_auc, "TPR@1%FPR": acrostics_t1, "TPR@5%FPR": acrostics_t5})
+results.append({"Method": "Acrostics ICW", "ROC-AUC": acrostics_auc, "TPR@1%FPR": acrostics_t1, "TPR@10%FPR": acrostics_t10})
 
 # ============================================================================
 # SUMMARY & VISUALIZATION
@@ -494,6 +562,28 @@ print("="*80)
 df = pd.DataFrame(results)
 print("\n" + df.to_string(index=False))
 
+# Compare to paper's results
+print("\n" + "="*80)
+print("COMPARISON TO PAPER (GPT-4o-mini results)")
+print("="*80)
+paper_results = {
+    "Unicode ICW": {"ROC-AUC": 1.000, "TPR@1%FPR": 1.000},
+    "Initials ICW": {"ROC-AUC": 0.572, "TPR@1%FPR": 0.006},
+    "Lexical ICW": {"ROC-AUC": 0.910, "TPR@1%FPR": 0.320},
+    "Acrostics ICW": {"ROC-AUC": 0.590, "TPR@1%FPR": 0.036}
+}
+
+print("\nMethod          | Your ROC-AUC | Paper ROC-AUC | Your TPR@1% | Paper TPR@1%")
+print("-" * 75)
+for method in ["Unicode ICW", "Initials ICW", "Lexical ICW", "Acrostics ICW"]:
+    your_auc = df[df["Method"] == method]["ROC-AUC"].values[0]
+    your_tpr = df[df["Method"] == method]["TPR@1%FPR"].values[0]
+    paper_auc = paper_results[method]["ROC-AUC"]
+    paper_tpr = paper_results[method]["TPR@1%FPR"]
+    print(f"{method:15} | {your_auc:12.4f} | {paper_auc:13.4f} | {your_tpr:11.4f} | {paper_tpr:12.4f}")
+
+print("\nNote: Paper uses GPT-4o-mini. Your model is smaller, so lower results are expected.")
+
 # Save results
 results_file = os.path.join(OUTPUT_DIR, "results.csv")
 df.to_csv(results_file, index=False)
@@ -502,7 +592,6 @@ print(f"\n✓ Results saved to {results_file}")
 # Visualizations
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-# ROC-AUC
 axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
 axes[0].set_ylabel("ROC-AUC", fontsize=11)
 axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
@@ -512,7 +601,6 @@ axes[0].tick_params(axis='x', rotation=45)
 axes[0].legend()
 axes[0].grid(axis='y', alpha=0.3)
 
-# TPR@1%FPR
 axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
 axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
 axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
@@ -520,10 +608,9 @@ axes[1].set_ylim(0, 1)
 axes[1].tick_params(axis='x', rotation=45)
 axes[1].grid(axis='y', alpha=0.3)
 
-# TPR@5%FPR
-axes[2].bar(df["Method"], df["TPR@5%FPR"], color="lightgreen", edgecolor="darkgreen")
-axes[2].set_ylabel("TPR @ 5% FPR", fontsize=11)
-axes[2].set_title("True Positive Rate at 5% FPR", fontsize=12, fontweight="bold")
+axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
+axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
+axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
 axes[2].set_ylim(0, 1)
 axes[2].tick_params(axis='x', rotation=45)
 axes[2].grid(axis='y', alpha=0.3)
@@ -538,7 +625,36 @@ print("\n" + "="*80)
 print("EVALUATION COMPLETE")
 print("="*80)
 print(f"\nAll outputs saved to: {OUTPUT_DIR}/")
-print(f"  - generation_log.jsonl (detailed logs)")
-print(f"  - results.csv (summary table)")
-print(f"  - icw_evaluation.png (visualizations)")
-print("\n")
+print(f"  - generation_log.jsonl (detailed generation logs)")
+print(f"  - results.csv (summary metrics)")
+print(f"  - icw_evaluation.png (visualization)")
+print("\n" + "="*80)
+print("INTERPRETATION GUIDE")
+print("="*80)
+print("""
+Your results show watermarking effectiveness for your model:
+
+ROC-AUC Interpretation:
+  • 0.50 = Random (no watermark detected)
+  • 0.50-0.70 = Weak watermark
+  • 0.70-0.90 = Moderate watermark
+  • 0.90-1.00 = Strong watermark
+
+TPR@1%FPR Interpretation:
+  • 0.00 = Unusable (no detection at strict threshold)
+  • 0.01-0.10 = Very weak detection
+  • 0.10-0.50 = Weak detection
+  • 0.50-0.90 = Good detection
+  • 0.90-1.00 = Excellent detection
+
+Why small models struggle:
+  1. Unicode ICW: Can't insert actual Unicode characters
+  2. Initials ICW: Can't consistently bias word choice
+  3. Lexical ICW: Can't track and use 36-word list
+  4. Acrostics ICW: Easiest (sentence-level), may show weak signal
+
+To improve results:
+  • Use larger model: MEMORY_STRATEGY='4bit' for 7B model
+  • Increase samples: NUM_SAMPLES=200 for more stable metrics
+  • Check generation_log.jsonl to see actual model outputs
+""")
