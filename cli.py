@@ -58,12 +58,12 @@ def list_models():
     print("  python cli.py --list-models")
     print()
 
-def run_experiment(model_strategy, temperature, num_samples, output_dir):
+def run_experiment(model_strategy, temperature, num_samples, output_dir, model_path=None):
     """Run the ICW experiment with specified configuration."""
 
     # Validate inputs
     valid_strategies = ["small", "4bit", "8bit", "full", "cpu", "auto"]
-    if model_strategy not in valid_strategies:
+    if model_strategy not in valid_strategies and model_path is None:
         print(f"Error: Invalid model strategy '{model_strategy}'")
         print(f"Valid options: {', '.join(valid_strategies)}")
         sys.exit(1)
@@ -82,8 +82,15 @@ def run_experiment(model_strategy, temperature, num_samples, output_dir):
     os.environ['ICW_NUM_SAMPLES'] = str(num_samples)
     os.environ['ICW_OUTPUT_DIR'] = output_dir
 
+    # If using a custom trained model path
+    if model_path:
+        os.environ['ICW_MODEL_PATH'] = model_path
+
     # Display configuration
-    config = get_model_config(model_strategy)
+    if model_path:
+        config = {"model_name": model_path, "description": "Custom trained model"}
+    else:
+        config = get_model_config(model_strategy)
 
     print("\n" + "="*80)
     print("EXPERIMENT CONFIGURATION")
@@ -162,6 +169,13 @@ Examples:
         help='Output directory (default: outputs)'
     )
 
+    parser.add_argument(
+        '--model-path',
+        type=str,
+        default=None,
+        help='Path to custom trained model (e.g., GRPO-trained model)'
+    )
+
     args = parser.parse_args()
 
     if args.list_models:
@@ -172,7 +186,8 @@ Examples:
         model_strategy=args.model,
         temperature=args.temperature,
         num_samples=args.samples,
-        output_dir=args.output
+        output_dir=args.output,
+        model_path=args.model_path
     )
 
 if __name__ == "__main__":

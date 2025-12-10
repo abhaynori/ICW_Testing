@@ -27,8 +27,17 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Auto-configure based on memory strategy
 from memory_config import get_model_config
-config = get_model_config(MEMORY_STRATEGY)
-MODEL_NAME = config["model_name"]
+
+# Check if a custom model path is provided (e.g., GRPO-trained model)
+CUSTOM_MODEL_PATH = os.getenv('ICW_MODEL_PATH', None)
+
+if CUSTOM_MODEL_PATH:
+    MODEL_NAME = CUSTOM_MODEL_PATH
+    config = {"model_name": MODEL_NAME, "device_map": "auto"}
+    print(f"Using custom trained model: {MODEL_NAME}")
+else:
+    config = get_model_config(MEMORY_STRATEGY)
+    MODEL_NAME = config["model_name"]
 
 print(f"\n{'='*80}")
 print(f"ICW WATERMARKING EVALUATION (Paper-Accurate Implementation)")

@@ -6,6 +6,7 @@ This repository implements and evaluates various Instruction-based Content Water
 
 - **Multiple ICW Strategies**: Unicode, Initials, Lexical, and Acrostics watermarking
 - **Multi-Model Support**: Qwen-2.5, Llama-3.1, Phi-4 (all with reasoning capabilities)
+- **GRPO Training**: Train models to produce better watermarks using reinforcement learning
 - **Flexible Architecture**: Uses `tokenizer.apply_chat_template()` for easy model switching
 - **Configurable Temperature**: Control generation randomness
 - **Comprehensive Logging**: All prompts and outputs saved to JSONL files
@@ -14,8 +15,24 @@ This repository implements and evaluates various Instruction-based Content Water
 
 ## Installation
 
+### Basic Installation
+
 ```bash
-pip install torch transformers datasets scikit-learn nltk python-Levenshtein sentence-transformers pandas matplotlib
+pip install torch transformers datasets scikit-learn nltk python-Levenshtein sentence-transformers pandas matplotlib accelerate bitsandbytes
+```
+
+### For GRPO Training (Optional)
+
+If you want to train models to produce better watermarks:
+
+```bash
+pip install trl peft
+```
+
+Or install everything:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ## Quick Start
@@ -52,6 +69,23 @@ python run_batch_experiments.py
 # Full batch test (3 models, 3 temperatures)
 python run_batch_experiments.py --full
 ```
+
+### Train Models with GRPO (New!)
+
+Improve watermarking performance using reinforcement learning:
+
+```bash
+# Train a model to produce better acrostic watermarks
+python grpo_train.py --model small --method acrostics --epochs 3 --samples 100
+
+# Test the trained model
+python cli.py --model-path "grpo_models/acrostics_small_*/final_model" --samples 50
+
+# Compare with base model
+python compare_models.py --base small --trained "grpo_models/acrostics_small_*/final_model" --method acrostics
+```
+
+**See [GRPO_QUICKSTART.md](GRPO_QUICKSTART.md) for quick start or [GRPO_TRAINING.md](GRPO_TRAINING.md) for full documentation.**
 
 ## Configuration
 
