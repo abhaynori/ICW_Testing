@@ -18,14 +18,59 @@ This repository implements and evaluates various Instruction-based Content Water
 pip install torch transformers datasets scikit-learn nltk python-Levenshtein sentence-transformers pandas matplotlib
 ```
 
+## Quick Start
+
+### Using the CLI (Recommended)
+
+The easiest way to run experiments with different models:
+
+```bash
+# List available models
+python cli.py --list-models
+
+# Run with 4-bit quantized model (best for most GPUs)
+python cli.py --model 4bit --temperature 0.7 --samples 50
+
+# Quick test with small model
+python cli.py --model small --temperature 0.7 --samples 20
+
+# Auto-detect best configuration for your hardware
+python cli.py --model auto --samples 50
+```
+
+See [CLI_USAGE.md](CLI_USAGE.md) for detailed documentation.
+
+### Run Batch Experiments
+
+```bash
+# Quick batch test (1 model, 1 temperature)
+python run_batch_experiments.py --quick
+
+# Default batch test (2 models, 2 temperatures)
+python run_batch_experiments.py
+
+# Full batch test (3 models, 3 temperatures)
+python run_batch_experiments.py --full
+```
+
 ## Configuration
+
+### CLI Method (Recommended)
+
+Use command-line arguments to configure experiments:
+
+```bash
+python cli.py --model MODEL --temperature TEMP --samples N
+```
+
+### Manual Method (Legacy)
 
 Edit the configuration section at the top of `main.py`:
 
 ```python
 # Configuration
 TEMPERATURE = 0.7  # Range: 0.0 (deterministic) to 2.0 (very random)
-MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"  # Choose from SUPPORTED_MODELS
+MEMORY_STRATEGY = "4bit"  # Options: "small", "4bit", "8bit", "full", "cpu"
 ```
 
 ### Supported Models

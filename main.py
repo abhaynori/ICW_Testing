@@ -18,10 +18,11 @@ nltk.download('averaged_perceptron_tagger', quiet=True)
 nltk.download('punkt_tab', quiet=True)
 
 # ===== CONFIGURATION =====
-MEMORY_STRATEGY = "4bit"  # Options: "small" (1.5B), "4bit" (7B), "8bit" (7B), "full" (7B)
-TEMPERATURE = 0.7
-NUM_SAMPLES = 50  # Increase to 200+ for more reliable statistics
-OUTPUT_DIR = "outputs"
+# Read from environment variables if set (for CLI usage), otherwise use defaults
+MEMORY_STRATEGY = os.getenv('ICW_MEMORY_STRATEGY', "4bit")  # Options: "small" (1.5B), "4bit" (7B), "8bit" (7B), "full" (7B)
+TEMPERATURE = float(os.getenv('ICW_TEMPERATURE', '0.7'))
+NUM_SAMPLES = int(os.getenv('ICW_NUM_SAMPLES', '50'))  # Increase to 200+ for more reliable statistics
+OUTPUT_DIR = os.getenv('ICW_OUTPUT_DIR', "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Auto-configure based on memory strategy
