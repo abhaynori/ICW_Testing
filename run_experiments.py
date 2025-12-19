@@ -40,9 +40,6 @@ def run_experiment(model_name, temperature):
     print(f"Running experiment: {model_name} @ T={temperature}")
     print(f"{'='*80}\n")
     
-    # Update config
-    update_config(model_name, temperature)
-    
     # Create unique output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_short = model_name.split("/")[-1]
@@ -53,6 +50,12 @@ def run_experiment(model_name, temperature):
     cmd = ["python", "main.py"]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"  # ensure immediate flushing from child
+    
+    # Pass configuration via environment variables
+    env["ICW_MODEL_PATH"] = model_name
+    env["ICW_TEMPERATURE"] = str(temperature)
+    env["ICW_MEMORY_STRATEGY"] = "full"  # Use full precision for H200
+    # Optional: set sample count if needed, e.g. env["ICW_NUM_SAMPLES"] = "50"
 
     start_time = time.time()
     timeout_seconds = 1800  # 30 minutes

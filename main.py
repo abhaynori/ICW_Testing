@@ -90,6 +90,7 @@ generation_config = {
     "temperature": TEMPERATURE,
     "top_p": 0.9,
     "pad_token_id": tokenizer.pad_token_id,
+    "use_cache": True,  # Enable KV cache for faster generation
 }
 
 def generate_response(messages):
