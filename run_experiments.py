@@ -6,6 +6,7 @@ Usage: python run_experiments.py
 import subprocess
 import os
 import json
+import time
 from datetime import datetime
 
 # Experiment configurations
@@ -48,35 +49,71 @@ def run_experiment(model_name, temperature):
     exp_dir = f"outputs/exp_{model_short}_T{temperature}_{timestamp}"
     os.makedirs(exp_dir, exist_ok=True)
     
-    # Run main.py
+    # Run main.py with live, line-by-line streaming
+    cmd = ["python", "main.py"]
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"  # ensure immediate flushing from child
+
+    start_time = time.time()
+    timeout_seconds = 1800  # 30 minutes
+    print(f"Starting main.py (logs streaming below). Timeout: {timeout_seconds//60} min")
+    print(f"Logs will also be saved to: {exp_dir}/stdout.txt and stderr.txt")
+
     try:
-        result = subprocess.run(
-            ["python", "main.py"],
-            capture_output=True,
-            text=True,
-            timeout=1800  # 30 minute timeout
-        )
-        
-        # Save stdout/stderr
-        with open(f"{exp_dir}/stdout.txt", "w") as f:
-            f.write(result.stdout)
-        with open(f"{exp_dir}/stderr.txt", "w") as f:
-            f.write(result.stderr)
-        
+        with open(f"{exp_dir}/stdout.txt", "w") as f_out, open(f"{exp_dir}/stderr.txt", "w") as f_err:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+                env=env,
+            )
+
+            # Stream stdout/stderr line by line
+            while True:
+                stdout_line = process.stdout.readline()
+                stderr_line = process.stderr.readline()
+
+                if stdout_line:
+                    print(stdout_line, end="", flush=True)
+                    f_out.write(stdout_line)
+
+                if stderr_line:
+                    print(f"[stderr] {stderr_line}", end="", flush=True)
+                    f_err.write(stderr_line)
+
+                # Exit condition: process ended and no more output
+                if stdout_line == "" and stderr_line == "" and process.poll() is not None:
+                    break
+
+                # Timeout guard
+                if time.time() - start_time > timeout_seconds:
+                    process.kill()
+                    print(f"\n✗ Experiment timed out after {timeout_seconds//60} minutes")
+                    return False
+
+            return_code = process.wait()
+
+        duration = time.time() - start_time
+        print(f"\nRuntime: {duration/60:.1f} minutes")
+
+        if return_code != 0:
+            print(f"✗ Experiment failed with return code {return_code}")
+            return False
+
         # Move generated files to experiment directory
-        for file in ["generation_log.jsonl", "icw_roc_auc.png", "icw_t1fpr.png"]:
+        for file in ["generation_log.jsonl", "icw_roc_auc.png", "icw_t1fpr.png", "results.csv"]:
             src = f"outputs/{file}"
             if os.path.exists(src):
                 dst = f"{exp_dir}/{file}"
                 os.rename(src, dst)
-        
+
         print(f"✓ Experiment completed successfully")
         print(f"  Results saved to: {exp_dir}")
         return True
-        
-    except subprocess.TimeoutExpired:
-        print(f"✗ Experiment timed out after 30 minutes")
-        return False
+
     except Exception as e:
         print(f"✗ Experiment failed with error: {e}")
         return False
