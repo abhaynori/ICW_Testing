@@ -58,7 +58,16 @@ def list_models():
     print("  python cli.py --list-models")
     print()
 
-def run_experiment(model_strategy, temperature, num_samples, output_dir, model_path=None, disable_wm_instruction=False):
+def run_experiment(
+    model_strategy,
+    temperature,
+    num_samples,
+    output_dir,
+    model_path=None,
+    disable_wm_instruction=False,
+    data_split="train",
+    generation_batch_size=4
+):
     """Run the ICW experiment with specified configuration."""
 
     # Validate inputs
@@ -76,16 +85,30 @@ def run_experiment(model_strategy, temperature, num_samples, output_dir, model_p
         print(f"Error: Number of samples must be between 1 and 1000 (got {num_samples})")
         sys.exit(1)
 
+    valid_splits = {"train", "validation", "test"}
+    if data_split not in valid_splits:
+        print(f"Error: Invalid split '{data_split}'")
+        print(f"Valid options: {', '.join(sorted(valid_splits))}")
+        sys.exit(1)
+
+    if generation_batch_size < 1:
+        print(f"Error: Generation batch size must be >= 1 (got {generation_batch_size})")
+        sys.exit(1)
+
     # Set environment variables to pass configuration to main.py
     os.environ['ICW_MEMORY_STRATEGY'] = model_strategy
     os.environ['ICW_TEMPERATURE'] = str(temperature)
     os.environ['ICW_NUM_SAMPLES'] = str(num_samples)
+    os.environ['ICW_DATASET_SPLIT'] = data_split
+    os.environ['ICW_GENERATION_BATCH_SIZE'] = str(generation_batch_size)
     os.environ['ICW_OUTPUT_DIR'] = output_dir
     os.environ['ICW_DISABLE_WM_INSTRUCTION'] = '1' if disable_wm_instruction else '0'
 
     # If using a custom trained model path
     if model_path:
         os.environ['ICW_MODEL_PATH'] = model_path
+    else:
+        os.environ.pop('ICW_MODEL_PATH', None)
 
     # Display configuration
     if model_path:
@@ -101,6 +124,8 @@ def run_experiment(model_strategy, temperature, num_samples, output_dir, model_p
     print(f"Description:      {config.get('description', 'N/A')}")
     print(f"Temperature:      {temperature}")
     print(f"Num Samples:      {num_samples}")
+    print(f"Dataset Split:    {data_split}")
+    print(f"Gen Batch Size:   {generation_batch_size}")
     print(f"Output Dir:       {output_dir}")
     print("="*80 + "\n")
 
@@ -184,6 +209,21 @@ Examples:
         help='Disable watermarking instructions for evaluation (useful for validation/test)'
     )
 
+    parser.add_argument(
+        '--split',
+        type=str,
+        default='train',
+        choices=['train', 'validation', 'test'],
+        help='ELI5 dataset split to evaluate on (default: train)'
+    )
+
+    parser.add_argument(
+        '--gen-batch-size',
+        type=int,
+        default=4,
+        help='Batch size for generation throughput (default: 4)'
+    )
+
     args = parser.parse_args()
 
     if args.list_models:
@@ -196,7 +236,9 @@ Examples:
         num_samples=args.samples,
         output_dir=args.output,
         model_path=args.model_path,
-        disable_wm_instruction=args.no_wm_instruction
+        disable_wm_instruction=args.no_wm_instruction,
+        data_split=args.split,
+        generation_batch_size=args.gen_batch_size
     )
 
 if __name__ == "__main__":

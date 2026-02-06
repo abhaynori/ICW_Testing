@@ -7,6 +7,7 @@ import subprocess
 import os
 import json
 import time
+import select
 from datetime import datetime
 
 # Experiment configurations
@@ -39,47 +40,47 @@ def run_experiment(model_name, temperature):
     env["ICW_MODEL_PATH"] = model_name
     env["ICW_TEMPERATURE"] = str(temperature)
     env["ICW_MEMORY_STRATEGY"] = "full"  # Use full precision for H200
+    env["ICW_OUTPUT_DIR"] = exp_dir
     # Optional: set sample count if needed, e.g. env["ICW_NUM_SAMPLES"] = "50"
 
     start_time = time.time()
     timeout_seconds = 1800  # 30 minutes
     print(f"Starting main.py (logs streaming below). Timeout: {timeout_seconds//60} min")
-    print(f"Logs will also be saved to: {exp_dir}/stdout.txt and stderr.txt")
+    print(f"Logs will also be saved to: {exp_dir}/combined.log")
 
     try:
-        with open(f"{exp_dir}/stdout.txt", "w") as f_out, open(f"{exp_dir}/stderr.txt", "w") as f_err:
+        with open(f"{exp_dir}/combined.log", "w") as f_log:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
                 universal_newlines=True,
                 env=env,
             )
 
-            # Stream stdout/stderr line by line
+            # Stream merged stdout/stderr safely without dual-pipe deadlocks.
             while True:
-                stdout_line = process.stdout.readline()
-                stderr_line = process.stderr.readline()
-
-                if stdout_line:
-                    print(stdout_line, end="", flush=True)
-                    f_out.write(stdout_line)
-
-                if stderr_line:
-                    print(f"[stderr] {stderr_line}", end="", flush=True)
-                    f_err.write(stderr_line)
-
-                # Exit condition: process ended and no more output
-                if stdout_line == "" and stderr_line == "" and process.poll() is not None:
-                    break
-
                 # Timeout guard
                 if time.time() - start_time > timeout_seconds:
                     process.kill()
                     print(f"\n✗ Experiment timed out after {timeout_seconds//60} minutes")
                     return False
+
+                ready, _, _ = select.select([process.stdout], [], [], 1.0)
+                if ready:
+                    line = process.stdout.readline()
+                    if line:
+                        print(line, end="", flush=True)
+                        f_log.write(line)
+                        continue
+
+                if process.poll() is not None:
+                    for line in process.stdout.readlines():
+                        print(line, end="", flush=True)
+                        f_log.write(line)
+                    break
 
             return_code = process.wait()
 
@@ -89,13 +90,6 @@ def run_experiment(model_name, temperature):
         if return_code != 0:
             print(f"✗ Experiment failed with return code {return_code}")
             return False
-
-        # Move generated files to experiment directory
-        for file in ["generation_log.jsonl", "icw_roc_auc.png", "icw_t1fpr.png", "results.csv"]:
-            src = f"outputs/{file}"
-            if os.path.exists(src):
-                dst = f"{exp_dir}/{file}"
-                os.rename(src, dst)
 
         print(f"✓ Experiment completed successfully")
         print(f"  Results saved to: {exp_dir}")

@@ -17,9 +17,14 @@ import os
 import json
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
 from datasets import load_dataset, Dataset
 import numpy as np
+
+try:
+    from trl import GRPOConfig, GRPOTrainer
+except Exception:
+    GRPOConfig = None
+    GRPOTrainer = None
 
 # Import existing detector functions and prompts from main.py
 import sys
@@ -68,16 +73,51 @@ class WatermarkRewardFunction:
         # Set up detector and arguments
         self.detector, self.detector_args = get_detector_and_args(method)
 
-    def __call__(self, texts):
+    @staticmethod
+    def _to_text(item):
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            for key in ("text", "content", "completion"):
+                if key in item and isinstance(item[key], str):
+                    return item[key]
+        if isinstance(item, (list, tuple)):
+            parts = []
+            for entry in item:
+                if isinstance(entry, dict):
+                    if "content" in entry and isinstance(entry["content"], str):
+                        parts.append(entry["content"])
+                    elif "text" in entry and isinstance(entry["text"], str):
+                        parts.append(entry["text"])
+                elif isinstance(entry, str):
+                    parts.append(entry)
+            if parts:
+                return " ".join(parts)
+        return str(item)
+
+    def _extract_texts(self, args, kwargs):
+        for key in ("completions", "texts", "responses", "outputs"):
+            value = kwargs.get(key)
+            if value is not None:
+                return [self._to_text(v) for v in value]
+        if args:
+            first = args[0]
+            if isinstance(first, list):
+                return [self._to_text(v) for v in first]
+            return [self._to_text(first)]
+        return []
+
+    def __call__(self, *args, **kwargs):
         """
         Compute rewards for a batch of generated texts.
 
         Args:
-            texts: List of generated text strings
+            *args/**kwargs: TRL passes completions in varying formats by version.
 
         Returns:
             rewards: Tensor of reward values
         """
+        texts = self._extract_texts(args, kwargs)
         rewards = []
         for text in texts:
             # Get detector score
@@ -138,7 +178,76 @@ def build_messages(query, prompt_fn=None, include_instruction=True):
     ]
 
 
-def compute_baseline_statistics(model, tokenizer, dataset, method, num_samples=50):
+def generate_responses_batch(
+    model,
+    tokenizer,
+    messages_batch,
+    max_new_tokens=200,
+    temperature=0.7,
+    top_p=0.9
+):
+    """Generate a batch of responses from chat messages."""
+    prompt_texts = [
+        tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        for messages in messages_batch
+    ]
+
+    try:
+        encoded = tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=tokenizer.pad_token_id
+            )
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower() or len(messages_batch) == 1:
+            raise
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"⚠️  OOM at generation batch size {len(messages_batch)}. Falling back to single-sample generation.")
+        fallback_responses = []
+        for messages in messages_batch:
+            fallback_responses.extend(
+                generate_responses_batch(
+                    model=model,
+                    tokenizer=tokenizer,
+                    messages_batch=[messages],
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p
+                )
+            )
+        return fallback_responses
+
+    responses = []
+    attention_mask = encoded["attention_mask"]
+    for idx in range(outputs.shape[0]):
+        prompt_len = int(attention_mask[idx].sum().item())
+        responses.append(
+            tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
+        )
+
+    return responses
+
+
+def compute_baseline_statistics(
+    model,
+    tokenizer,
+    dataset,
+    method,
+    num_samples=50,
+    generation_batch_size=4
+):
     """
     Compute baseline statistics from non-watermarked generations.
     These are used to normalize rewards.
@@ -149,35 +258,30 @@ def compute_baseline_statistics(model, tokenizer, dataset, method, num_samples=5
 
     scores = []
 
-    # Generate non-watermarked samples
-    for i, example in enumerate(dataset.select(range(min(num_samples, len(dataset))))):
-        if (i + 1) % 10 == 0:
-            print(f"  Progress: {i+1}/{num_samples}")
+    samples = dataset.select(range(min(num_samples, len(dataset))))
+    queries = samples["query"]
+    total = len(queries)
 
-        query = example["query"]
+    for start in range(0, total, generation_batch_size):
+        end = min(start + generation_batch_size, total)
+        batch_queries = queries[start:end]
+        messages_batch = [build_messages(query, include_instruction=False) for query in batch_queries]
+        responses = generate_responses_batch(
+            model=model,
+            tokenizer=tokenizer,
+            messages_batch=messages_batch,
+            max_new_tokens=200,
+            temperature=0.7,
+            top_p=0.9
+        )
 
-        # Non-watermarked prompt
-        messages = build_messages(query, include_instruction=False)
+        for response in responses:
+            score = detector(response, *detector_args)
+            scores.append(score)
 
-        input_ids = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(model.device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids,
-                max_new_tokens=200,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=tokenizer.pad_token_id
-            )
-
-        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-        score = detector(response, *detector_args)
-        scores.append(score)
+        processed = end
+        if processed % 10 == 0 or processed == total:
+            print(f"  Progress: {processed}/{total}")
 
     mean = np.mean(scores)
     std = np.std(scores)
@@ -197,7 +301,10 @@ def evaluate_model_on_split(
     include_instruction,
     max_samples,
     output_dir,
-    split_name
+    split_name,
+    generation_batch_size=4,
+    baseline_mean=None,
+    baseline_std=None
 ):
     """Evaluate detector scores on a dataset split."""
     detector, detector_args = get_detector_and_args(method)
@@ -207,40 +314,46 @@ def evaluate_model_on_split(
     samples = dataset.select(range(min(max_samples, len(dataset))))
 
     model.eval()
-    for i, example in enumerate(samples):
-        if (i + 1) % 10 == 0:
-            print(f"  Eval progress ({split_name}): {i+1}/{len(samples)}")
+    queries = samples["query"]
+    total = len(queries)
 
-        query = example["query"]
-        messages = build_messages(query, prompt_fn=prompt_fn, include_instruction=include_instruction)
+    for start in range(0, total, generation_batch_size):
+        end = min(start + generation_batch_size, total)
+        batch_queries = queries[start:end]
+        messages_batch = [
+            build_messages(query, prompt_fn=prompt_fn, include_instruction=include_instruction)
+            for query in batch_queries
+        ]
+        responses = generate_responses_batch(
+            model=model,
+            tokenizer=tokenizer,
+            messages_batch=messages_batch,
+            max_new_tokens=200,
+            temperature=0.7,
+            top_p=0.9
+        )
 
-        input_ids = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(model.device)
+        for query, response in zip(batch_queries, responses):
+            score = detector(response, *detector_args)
+            scores.append(score)
+            records.append({
+                "query": query,
+                "response": response,
+                "score": score
+            })
 
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids,
-                max_new_tokens=200,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=tokenizer.pad_token_id
-            )
-
-        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-        score = detector(response, *detector_args)
-        scores.append(score)
-        records.append({
-            "query": query,
-            "response": response,
-            "score": score
-        })
+        processed = end
+        if processed % 10 == 0 or processed == total:
+            print(f"  Eval progress ({split_name}): {processed}/{total}")
 
     mean = float(np.mean(scores)) if scores else 0.0
     std = float(np.std(scores)) if scores else 0.0
+    normalized_mean = None
+    if baseline_mean is not None:
+        if baseline_std is not None and baseline_std > 0:
+            normalized_mean = float((mean - baseline_mean) / baseline_std)
+        else:
+            normalized_mean = float(mean - baseline_mean)
 
     summary = {
         "split": split_name,
@@ -250,6 +363,8 @@ def evaluate_model_on_split(
         "mean_score": mean,
         "std_score": std
     }
+    if normalized_mean is not None:
+        summary["mean_score_vs_baseline_z"] = normalized_mean
 
     output = {
         "summary": summary,
@@ -262,6 +377,8 @@ def evaluate_model_on_split(
 
     print(f"✓ Saved {split_name} evaluation to: {eval_path}")
     print(f"  Mean score: {mean:.4f}, Std: {std:.4f}")
+    if normalized_mean is not None:
+        print(f"  Mean score vs training baseline (z): {normalized_mean:.4f}")
 
     return summary
 
@@ -276,7 +393,8 @@ def train_grpo(
     output_dir="grpo_models",
     eval_splits="validation,test",
     eval_samples=50,
-    eval_no_instruction=True
+    eval_no_instruction=True,
+    generation_batch_size=4
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -302,8 +420,16 @@ def train_grpo(
     print(f"Training Samples: {num_train_samples}")
     print(f"Epochs: {num_epochs}")
     print(f"Batch Size: {batch_size}")
+    print(f"Generation Batch Size: {generation_batch_size}")
     print(f"Learning Rate: {learning_rate}")
+    print(f"Eval Without Instructions: {eval_no_instruction}")
     print("="*80 + "\n")
+
+    if GRPOConfig is None or GRPOTrainer is None:
+        raise ImportError(
+            "TRL with GRPO support is required for training. "
+            "Install dependencies with: pip install -r requirements.txt"
+        )
 
     # Load model and tokenizer
     print("Loading base model...")
@@ -343,7 +469,12 @@ def train_grpo(
 
     # Compute baseline statistics
     baseline_mean, baseline_std = compute_baseline_statistics(
-        model, tokenizer, dataset, method, num_samples=min(50, num_train_samples)
+        model,
+        tokenizer,
+        dataset,
+        method,
+        num_samples=min(50, num_train_samples),
+        generation_batch_size=generation_batch_size
     )
 
     # Create reward function
@@ -371,35 +502,62 @@ def train_grpo(
     tokenized_dataset = dataset.map(tokenize_function, batched=True)
 
     # GRPO Configuration
-    training_args = GRPOConfig(
-        output_dir=os.path.join(output_dir, f"{method}_{model_strategy}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=batch_size,
-        learning_rate=learning_rate,
-        logging_steps=10,
-        save_steps=100,
-        save_total_limit=2,
-        gradient_accumulation_steps=4,
-        warmup_steps=10,
-        max_grad_norm=1.0,
-        seed=42,
-        # GRPO specific
-        num_generation_per_prompt=4,  # Generate multiple completions per prompt
-        max_new_tokens=200,
-        temperature=0.7,
-        top_p=0.9,
-    )
+    base_training_args = {
+        "output_dir": os.path.join(output_dir, f"{method}_{model_strategy}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
+        "num_train_epochs": num_epochs,
+        "per_device_train_batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "logging_steps": 10,
+        "save_steps": 100,
+        "save_total_limit": 2,
+        "gradient_accumulation_steps": 4,
+        "warmup_steps": 10,
+        "max_grad_norm": 1.0,
+        "seed": 42,
+        "max_new_tokens": 200,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+    try:
+        training_args = GRPOConfig(
+            **base_training_args,
+            num_generation_per_prompt=4,  # Older naming in some TRL releases
+        )
+    except TypeError:
+        training_args = GRPOConfig(
+            **base_training_args,
+            num_generations=4,  # Newer naming in some TRL releases
+        )
 
     # Initialize GRPO Trainer
     print("\nInitializing GRPO Trainer...")
 
-    trainer = GRPOTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
-        reward_function=reward_fn,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": tokenized_dataset,
+        "tokenizer": tokenizer,
+    }
+
+    try:
+        trainer = GRPOTrainer(
+            **trainer_kwargs,
+            reward_function=reward_fn,
+        )
+    except TypeError as exc:
+        # Compatibility fallback for TRL versions using reward_funcs instead.
+        if "reward_function" not in str(exc):
+            raise
+        try:
+            trainer = GRPOTrainer(
+                **trainer_kwargs,
+                reward_funcs=reward_fn,
+            )
+        except TypeError:
+            trainer = GRPOTrainer(
+                **trainer_kwargs,
+                reward_funcs=[reward_fn],
+            )
 
     print("✓ Trainer initialized\n")
 
@@ -463,7 +621,10 @@ def train_grpo(
                     include_instruction=not eval_no_instruction,
                     max_samples=eval_samples,
                     output_dir=training_args.output_dir,
-                    split_name=split_name
+                    split_name=split_name,
+                    generation_batch_size=generation_batch_size,
+                    baseline_mean=baseline_mean,
+                    baseline_std=baseline_std
                 )
 
     return final_model_path
@@ -492,8 +653,8 @@ Examples:
         '--model', '-m',
         type=str,
         default='small',
-        choices=['small', '8bit', 'cpu'],
-        help='Model strategy (Note: 4bit not recommended for training)'
+        choices=['small', '4bit', '8bit', 'full', 'cpu'],
+        help='Model strategy (4bit is allowed but generally unstable for training)'
     )
 
     parser.add_argument(
@@ -534,8 +695,17 @@ Examples:
 
     parser.add_argument(
         '--eval-no-instruction',
+        dest='eval_no_instruction',
         action='store_true',
-        help='Disable watermarking instructions during eval (validation/test)'
+        default=True,
+        help='Disable watermarking instructions during eval (default behavior)'
+    )
+
+    parser.add_argument(
+        '--eval-with-instruction',
+        dest='eval_no_instruction',
+        action='store_false',
+        help='Enable watermarking instructions during eval'
     )
 
     parser.add_argument(
@@ -559,7 +729,17 @@ Examples:
         help='Output directory for trained models (default: grpo_models)'
     )
 
+    parser.add_argument(
+        '--gen-batch-size',
+        type=int,
+        default=4,
+        help='Batch size for generation during baseline/eval (default: 4)'
+    )
+
     args = parser.parse_args()
+
+    if args.gen_batch_size < 1:
+        parser.error("--gen-batch-size must be >= 1")
 
     # Train
     model_path = train_grpo(
@@ -572,7 +752,8 @@ Examples:
         output_dir=args.output_dir,
         eval_splits=args.eval_splits,
         eval_samples=args.eval_samples,
-        eval_no_instruction=args.eval_no_instruction
+        eval_no_instruction=args.eval_no_instruction,
+        generation_batch_size=args.gen_batch_size
     )
 
     print("\n" + "="*80)
@@ -580,11 +761,10 @@ Examples:
     print("="*80)
     print(f"\n1. Test the trained model:")
     print(f"   python cli.py --model-path {model_path} --samples 50")
-    if args.eval_no_instruction:
-        print(f"   # Optional: evaluate without watermark instructions")
-        print(f"   python cli.py --model-path {model_path} --samples 50 --no-wm-instruction")
+    print(f"   # Validation/test-style evaluation without watermark instructions")
+    print(f"   python cli.py --model-path {model_path} --samples 50 --split test --no-wm-instruction")
     print(f"\n2. Compare with base model:")
-    print(f"   python compare_models.py --base {args.model} --trained {model_path} --method {args.method}")
+    print(f"   python compare_models.py --base {args.model} --trained {model_path} --method {args.method} --split test --no-wm-instruction")
     print(f"\n3. Train on other methods:")
     print(f"   python grpo_train.py --model {args.model} --method <other_method> --epochs {args.epochs}")
     print()

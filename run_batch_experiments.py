@@ -60,20 +60,15 @@ def run_experiment(model_strategy, temperature, num_samples, base_output_dir="ba
     ]
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600  # 1 hour timeout
-        )
-
-        # Save stdout/stderr
         log_file = os.path.join(output_dir, "experiment_log.txt")
         with open(log_file, "w") as f:
-            f.write("=== STDOUT ===\n")
-            f.write(result.stdout)
-            f.write("\n\n=== STDERR ===\n")
-            f.write(result.stderr)
+            result = subprocess.run(
+                cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=3600  # 1 hour timeout
+            )
 
         if result.returncode == 0:
             print(f"✓ Experiment completed successfully")

@@ -10,20 +10,51 @@ import Levenshtein
 import json
 from datetime import datetime
 import os
+import re
 import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
 
 def _ensure_nltk_data():
     """Download NLTK data only if not already present."""
-    for resource, name in [('taggers/averaged_perceptron_tagger', 'averaged_perceptron_tagger'),
-                           ('tokenizers/punkt_tab', 'punkt_tab')]:
+    missing = []
+    for resource, name in [
+        ('taggers/averaged_perceptron_tagger', 'averaged_perceptron_tagger'),
+        ('tokenizers/punkt_tab', 'punkt_tab')
+    ]:
         try:
             nltk.data.find(resource)
         except LookupError:
-            nltk.download(name, quiet=True)
+            try:
+                nltk.download(name, quiet=True)
+                nltk.data.find(resource)
+            except Exception:
+                missing.append(name)
+    if missing:
+        warnings.warn(
+            f"Missing NLTK resources ({', '.join(sorted(set(missing)))}). "
+            "Falling back to lightweight tokenization where needed."
+        )
+    return len(missing) == 0
 
-_ensure_nltk_data()
+NLTK_READY = _ensure_nltk_data()
+
+
+def _fallback_sent_tokenize(text):
+    """Fallback sentence tokenizer when punkt resources are unavailable."""
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+    return sentences if sentences else ([text.strip()] if text.strip() else [])
+
+
+def _extract_sentence_initials(sentences):
+    """Extract first alphabetical character from each sentence."""
+    initials = []
+    for sentence in sentences:
+        for char in sentence.strip():
+            if char.isalpha():
+                initials.append(char.upper())
+                break
+    return ''.join(initials)
 
 # ===== CONFIGURATION =====
 # These are read at import time but only used by the main() function
@@ -465,12 +496,18 @@ def lexical_detector(text, green_words):
     Paper detector: D(y|kL,τL) := (|y|G - γ|y|) / sqrt(γ(1-γ)|y|)
     CRITICAL: Filter to adjectives, adverbs, verbs BEFORE counting
     """
-    tokens = word_tokenize(text.lower())
-    tagged = pos_tag(tokens)
-    
-    candidates = [word for word, tag in tagged 
-                  if (tag.startswith('JJ') or tag.startswith('RB') or tag.startswith('VB'))
-                  and word.isalpha()]
+    try:
+        tokens = word_tokenize(text.lower())
+        tagged = pos_tag(tokens)
+        candidates = [
+            word for word, tag in tagged
+            if (tag.startswith('JJ') or tag.startswith('RB') or tag.startswith('VB')) and word.isalpha()
+        ]
+    except LookupError:
+        # Fallback: use alphabetical words when NLTK taggers/tokenizers are unavailable.
+        _ensure_nltk_data()
+        tokens = re.findall(r"[A-Za-z]+", text.lower())
+        candidates = tokens
     
     if len(candidates) == 0:
         return 0
@@ -490,6 +527,7 @@ def lexical_detector(text, green_words):
 
 # --- 4. Acrostics ICW ---
 secret_sequence = "SECRET"
+ACROSTICS_BASELINE_CACHE = {}
 
 def acrostics_embed_prompt(query):
     """Paper prompt: Structure response as acrostic of secret string."""
@@ -520,12 +558,16 @@ def acrostics_detector(text, secret_sequence):
     Paper detector: D(y|ks,τs) := (μ - d(ℓ,ζ)) / σ
     Uses Levenshtein distance and resampling
     """
-    sentences = sent_tokenize(text)
+    try:
+        sentences = sent_tokenize(text)
+    except LookupError:
+        _ensure_nltk_data()
+        sentences = _fallback_sent_tokenize(text)
     
     if len(sentences) == 0:
         return 0
     
-    initials = ''.join(sent[0].upper() for sent in sentences if sent and sent[0].isalpha())
+    initials = _extract_sentence_initials(sentences)
     
     if len(initials) == 0:
         return 0
@@ -534,18 +576,25 @@ def acrostics_detector(text, secret_sequence):
     expected = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
     actual_distance = Levenshtein.distance(initials, expected)
     
-    # Resample to estimate μ and σ
-    N_resamples = 100
-    resampled_distances = []
-    alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    
-    for _ in range(N_resamples):
-        random_initials = ''.join(np.random.choice(list(alphabet), size=n))
-        dist = Levenshtein.distance(random_initials, expected)
-        resampled_distances.append(dist)
-    
-    mu = np.mean(resampled_distances)
-    sigma = np.std(resampled_distances, ddof=1)
+    cache_key = (secret_sequence.upper(), n)
+    if cache_key in ACROSTICS_BASELINE_CACHE:
+        mu, sigma = ACROSTICS_BASELINE_CACHE[cache_key]
+    else:
+        # Estimate μ and σ once per sequence length for faster repeated scoring.
+        N_resamples = 100
+        alphabet = np.array(list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+        seed = 1337 + n * 17 + len(secret_sequence)
+        rng = np.random.default_rng(seed)
+        resampled_distances = []
+
+        for _ in range(N_resamples):
+            random_initials = ''.join(rng.choice(alphabet, size=n))
+            dist = Levenshtein.distance(random_initials, expected)
+            resampled_distances.append(dist)
+
+        mu = np.mean(resampled_distances)
+        sigma = np.std(resampled_distances, ddof=1)
+        ACROSTICS_BASELINE_CACHE[cache_key] = (mu, sigma)
     
     if sigma == 0:
         return 0
@@ -610,9 +659,13 @@ def analyze_watermark_compliance(texts, detector, detector_args, method_name):
                 print(f"  ⚠️  No significant increase in green letters - watermark not applied")
         
         elif "Lexical" in method_name:
-            tokens = word_tokenize(texts[i].lower())
-            tagged = pos_tag(tokens)
-            candidates = [w for w, t in tagged if (t.startswith('JJ') or t.startswith('RB') or t.startswith('VB')) and w.isalpha()]
+            try:
+                tokens = word_tokenize(texts[i].lower())
+                tagged = pos_tag(tokens)
+                candidates = [w for w, t in tagged if (t.startswith('JJ') or t.startswith('RB') or t.startswith('VB')) and w.isalpha()]
+            except LookupError:
+                _ensure_nltk_data()
+                candidates = re.findall(r"[A-Za-z]+", texts[i].lower())
             green_found = [w for w in candidates if w in green_words]
             print(f"  Candidate words (JJ/RB/VB): {len(candidates)}")
             print(f"  Green words found: {len(green_found)}")
@@ -622,8 +675,12 @@ def analyze_watermark_compliance(texts, detector, detector_args, method_name):
                 print(f"  ⚠️  No green words found - model ignoring word list")
         
         elif "Acrostics" in method_name:
-            sentences = sent_tokenize(texts[i])
-            initials = ''.join(s[0].upper() for s in sentences if s and s[0].isalpha())
+            try:
+                sentences = sent_tokenize(texts[i])
+            except LookupError:
+                _ensure_nltk_data()
+                sentences = _fallback_sent_tokenize(texts[i])
+            initials = _extract_sentence_initials(sentences)
             n = len(initials)
             expected = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
             distance = Levenshtein.distance(initials, expected)
@@ -631,10 +688,11 @@ def analyze_watermark_compliance(texts, detector, detector_args, method_name):
             print(f"  Sentences: {len(sentences)}")
             print(f"  Initials: {initials}")
             print(f"  Expected: {expected}")
-            print(f"  Matches: {matches}/{n} ({matches/n*100:.0f}%)")
+            ratio = (matches / n * 100) if n > 0 else 0.0
+            print(f"  Matches: {matches}/{n} ({ratio:.0f}%)")
             print(f"  Levenshtein distance: {distance}")
             
-            if matches / n < 0.3:  # Less than 30% match
+            if n > 0 and (matches / n) < 0.3:  # Less than 30% match
                 print(f"  ⚠️  Low match rate - watermark weakly applied")
 
 # ============================================================================
@@ -703,6 +761,41 @@ def evaluate_strategy(wm_texts, detector, detector_args, non_wm_texts, method_na
     return auc, tpr_at_1fpr, tpr_at_10fpr
 
 
+def summarize_detector_scores(texts, detector, detector_args, method_name):
+    """Summarize detector behavior on a single corpus (no ROC baseline)."""
+    scores = [detector(text, *detector_args) for text in texts]
+    if not scores:
+        return {
+            "Method": method_name,
+            "Mean Score": 0.0,
+            "Std Score": 0.0,
+            "Min Score": 0.0,
+            "Max Score": 0.0,
+            "ROC-AUC": np.nan,
+            "TPR@1%FPR": np.nan,
+            "TPR@10%FPR": np.nan,
+        }
+
+    summary = {
+        "Method": method_name,
+        "Mean Score": float(np.mean(scores)),
+        "Std Score": float(np.std(scores)),
+        "Min Score": float(np.min(scores)),
+        "Max Score": float(np.max(scores)),
+        "ROC-AUC": np.nan,
+        "TPR@1%FPR": np.nan,
+        "TPR@10%FPR": np.nan,
+    }
+
+    print(f"\n{method_name} detector summary (no-instruction mode):")
+    print(f"  Mean: {summary['Mean Score']:.4f}")
+    print(f"  Std:  {summary['Std Score']:.4f}")
+    print(f"  Min:  {summary['Min Score']:.4f}")
+    print(f"  Max:  {summary['Max Score']:.4f}")
+
+    return summary
+
+
 # ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
@@ -714,19 +807,28 @@ def run_pipeline():
     MEMORY_STRATEGY = os.getenv('ICW_MEMORY_STRATEGY', "4bit")
     TEMPERATURE = float(os.getenv('ICW_TEMPERATURE', '0.7'))
     NUM_SAMPLES = int(os.getenv('ICW_NUM_SAMPLES', '50'))
+    DATASET_SPLIT = os.getenv('ICW_DATASET_SPLIT', "train")
+    GENERATION_BATCH_SIZE = max(1, int(os.getenv('ICW_GENERATION_BATCH_SIZE', '4')))
+    SHOW_PLOTS = os.getenv('ICW_SHOW_PLOTS', '0').lower() in {"1", "true", "yes"}
     OUTPUT_DIR = os.getenv('ICW_OUTPUT_DIR', "outputs")
     DISABLE_WM_INSTRUCTION = os.getenv('ICW_DISABLE_WM_INSTRUCTION', '0').lower() in {"1", "true", "yes"}
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    if DATASET_SPLIT not in {"train", "validation", "test"}:
+        warnings.warn(f"Unknown split '{DATASET_SPLIT}', falling back to 'train'")
+        DATASET_SPLIT = "train"
+
     # Check if a custom model path is provided (e.g., GRPO-trained model)
     CUSTOM_MODEL_PATH = os.getenv('ICW_MODEL_PATH', None)
+    config = get_model_config(MEMORY_STRATEGY)
 
     if CUSTOM_MODEL_PATH:
         MODEL_NAME = CUSTOM_MODEL_PATH
-        config = {"model_name": MODEL_NAME, "device_map": "auto"}
+        # Reuse selected memory strategy to preserve dtype/quantization behavior.
+        config = dict(config)
+        config["model_name"] = MODEL_NAME
         print(f"Using custom trained model: {MODEL_NAME}")
     else:
-        config = get_model_config(MEMORY_STRATEGY)
         MODEL_NAME = config["model_name"]
 
     print(f"\n{'='*80}")
@@ -736,6 +838,9 @@ def run_pipeline():
     print(f"Model: {MODEL_NAME}")
     print(f"Temperature: {TEMPERATURE}")
     print(f"Samples: {NUM_SAMPLES}")
+    print(f"Dataset Split: {DATASET_SPLIT}")
+    print(f"Generation Batch Size: {GENERATION_BATCH_SIZE}")
+    print(f"Show Plots: {SHOW_PLOTS}")
     print(f"Watermark Instructions Disabled: {DISABLE_WM_INSTRUCTION}")
     print(f"{'='*80}")
 
@@ -784,17 +889,42 @@ def run_pipeline():
         "use_cache": True,
     }
 
-    def generate_response(messages):
-        """Generate response using chat template."""
-        input_ids = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(model.device)
+    def generate_responses(messages_batch):
+        """Generate responses for a batch of chat messages."""
+        prompt_texts = [
+            tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            for messages in messages_batch
+        ]
 
-        outputs = model.generate(input_ids, **generation_config)
-        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-        return response
+        try:
+            encoded = tokenizer(
+                prompt_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            ).to(model.device)
+            with torch.no_grad():
+                outputs = model.generate(**encoded, **generation_config)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower() or len(messages_batch) == 1:
+                raise
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            warnings.warn(
+                f"OOM at batch size {len(messages_batch)}. Falling back to single-sample generation."
+            )
+            fallback_responses = []
+            for messages in messages_batch:
+                fallback_responses.extend(generate_responses([messages]))
+            return fallback_responses
+
+        responses = []
+        attention_mask = encoded["attention_mask"]
+        for idx in range(outputs.shape[0]):
+            prompt_len = int(attention_mask[idx].sum().item())
+            responses.append(tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True))
+
+        return responses
 
     # Buffered log writer to reduce per-sample disk I/O
     log_buffer = []
@@ -806,6 +936,7 @@ def run_pipeline():
             "method": method,
             "model": MODEL_NAME,
             "temperature": TEMPERATURE,
+            "dataset_split": DATASET_SPLIT,
             "query": query,
             "prompt": prompt,
             "output": output
@@ -831,7 +962,15 @@ def run_pipeline():
 
     # Load dataset
     print("Loading dataset...")
-    eli5 = load_dataset("sentence-transformers/eli5", "pair", split="train")["question"][:NUM_SAMPLES]
+    try:
+        eli5 = load_dataset("sentence-transformers/eli5", "pair", split=DATASET_SPLIT)["question"][:NUM_SAMPLES]
+    except Exception as exc:
+        if DATASET_SPLIT != "train":
+            warnings.warn(f"Could not load split '{DATASET_SPLIT}' ({exc}). Falling back to 'train'.")
+            DATASET_SPLIT = "train"
+            eli5 = load_dataset("sentence-transformers/eli5", "pair", split=DATASET_SPLIT)["question"][:NUM_SAMPLES]
+        else:
+            raise
     print(f"✓ Loaded {len(eli5)} questions\n")
 
     # ========================================================================
@@ -839,7 +978,7 @@ def run_pipeline():
     # ========================================================================
 
     print("="*80)
-    print("GENERATING WATERMARKED TEXT")
+    print("GENERATING TEXT")
     print("="*80)
 
     unicode_watermarked = []
@@ -847,53 +986,77 @@ def run_pipeline():
     lexical_watermarked = []
     acrostics_watermarked = []
     non_wm_texts = []
+    instructionless_texts = []
 
-    for i, query in enumerate(eli5):
-        if (i + 1) % 10 == 0:
-            print(f"Progress: {i+1}/{NUM_SAMPLES}")
+    if DISABLE_WM_INSTRUCTION:
+        print("\nNo-instruction evaluation mode enabled.")
+        print("Generating a single instructionless corpus and scoring it with each detector.")
+        total = len(eli5)
+        for start in range(0, total, GENERATION_BATCH_SIZE):
+            end = min(start + GENERATION_BATCH_SIZE, total)
+            batch_queries = eli5[start:end]
+            messages_batch = [
+                [
+                    {"role": "system", "content": "You are a helpful assistant. Provide clear, informative answers."},
+                    {"role": "user", "content": query}
+                ]
+                for query in batch_queries
+            ]
+            responses = generate_responses(messages_batch)
+            for query, messages, response in zip(batch_queries, messages_batch, responses):
+                instructionless_texts.append(response)
+                prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+                log_generation(query, prompt_str, response, "No-instruction Probe")
 
-        # Unicode ICW
-        messages = build_messages_for_method("unicode", query, DISABLE_WM_INSTRUCTION)
-        response = generate_response(messages)
-        unicode_watermarked.append(response)
-        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-        log_generation(query, prompt_str, response, "Unicode ICW")
-
-        # Initials ICW
-        messages = build_messages_for_method("initials", query, DISABLE_WM_INSTRUCTION)
-        response = generate_response(messages)
-        initials_watermarked.append(response)
-        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-        log_generation(query, prompt_str, response, "Initials ICW")
-
-        # Lexical ICW
-        messages = build_messages_for_method("lexical", query, DISABLE_WM_INSTRUCTION)
-        response = generate_response(messages)
-        lexical_watermarked.append(response)
-        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-        log_generation(query, prompt_str, response, "Lexical ICW")
-
-        # Acrostics ICW
-        messages = build_messages_for_method("acrostics", query, DISABLE_WM_INSTRUCTION)
-        response = generate_response(messages)
-        acrostics_watermarked.append(response)
-        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-        log_generation(query, prompt_str, response, "Acrostics ICW")
-
-        # Non-watermarked baseline
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant. Provide clear, informative answers."},
-            {"role": "user", "content": query}
+            processed = end
+            if processed % 10 == 0 or processed == total:
+                print(f"  Progress (No-instruction Probe): {processed}/{total}")
+    else:
+        method_runs = [
+            ("Unicode ICW", "unicode", unicode_watermarked, False),
+            ("Initials ICW", "initials", initials_watermarked, False),
+            ("Lexical ICW", "lexical", lexical_watermarked, False),
+            ("Acrostics ICW", "acrostics", acrostics_watermarked, False),
+            ("Non-watermarked", None, non_wm_texts, True),
         ]
-        response = generate_response(messages)
-        non_wm_texts.append(response)
-        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-        log_generation(query, prompt_str, response, "Non-watermarked")
+
+        for method_name, method_key, destination, disable_instruction in method_runs:
+            print(f"\nGenerating {method_name} outputs...")
+            total = len(eli5)
+            for start in range(0, total, GENERATION_BATCH_SIZE):
+                end = min(start + GENERATION_BATCH_SIZE, total)
+                batch_queries = eli5[start:end]
+                if method_key is None:
+                    messages_batch = [
+                        [
+                            {"role": "system", "content": "You are a helpful assistant. Provide clear, informative answers."},
+                            {"role": "user", "content": query}
+                        ]
+                        for query in batch_queries
+                    ]
+                else:
+                    messages_batch = [
+                        build_messages_for_method(method_key, query, disable_instruction)
+                        for query in batch_queries
+                    ]
+
+                responses = generate_responses(messages_batch)
+                for query, messages, response in zip(batch_queries, messages_batch, responses):
+                    destination.append(response)
+                    prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+                    log_generation(query, prompt_str, response, method_name)
+
+                processed = end
+                if processed % 10 == 0 or processed == total:
+                    print(f"  Progress ({method_name}): {processed}/{total}")
 
     # Flush remaining log entries
     flush_logs()
 
-    print(f"✓ Generated {NUM_SAMPLES} samples for each method\n")
+    if DISABLE_WM_INSTRUCTION:
+        print(f"✓ Generated {NUM_SAMPLES} instructionless samples\n")
+    else:
+        print(f"✓ Generated {NUM_SAMPLES} samples for each method\n")
 
     # ========================================================================
     # RUN EVALUATIONS
@@ -904,34 +1067,45 @@ def run_pipeline():
     print("="*80)
 
     results = []
+    method_definitions = [
+        ("Unicode ICW", unicode_detector, ()),
+        ("Initials ICW", initials_detector, (green_letters,)),
+        ("Lexical ICW", lexical_detector, (green_words,)),
+        ("Acrostics ICW", acrostics_detector, (secret_sequence,)),
+    ]
 
-    # Unicode ICW
-    analyze_watermark_compliance(unicode_watermarked, unicode_detector, (), "Unicode ICW")
-    unicode_auc, unicode_t1, unicode_t10 = evaluate_strategy(
-        unicode_watermarked, unicode_detector, (), non_wm_texts, "Unicode ICW"
-    )
-    results.append({"Method": "Unicode ICW", "ROC-AUC": unicode_auc, "TPR@1%FPR": unicode_t1, "TPR@10%FPR": unicode_t10})
+    if DISABLE_WM_INSTRUCTION:
+        for method_name, detector, detector_args in method_definitions:
+            analyze_watermark_compliance(instructionless_texts, detector, detector_args, method_name)
+            results.append(summarize_detector_scores(instructionless_texts, detector, detector_args, method_name))
+    else:
+        # Unicode ICW
+        analyze_watermark_compliance(unicode_watermarked, unicode_detector, (), "Unicode ICW")
+        unicode_auc, unicode_t1, unicode_t10 = evaluate_strategy(
+            unicode_watermarked, unicode_detector, (), non_wm_texts, "Unicode ICW"
+        )
+        results.append({"Method": "Unicode ICW", "ROC-AUC": unicode_auc, "TPR@1%FPR": unicode_t1, "TPR@10%FPR": unicode_t10})
 
-    # Initials ICW
-    analyze_watermark_compliance(initials_watermarked, initials_detector, (green_letters,), "Initials ICW")
-    initials_auc, initials_t1, initials_t10 = evaluate_strategy(
-        initials_watermarked, initials_detector, (green_letters,), non_wm_texts, "Initials ICW"
-    )
-    results.append({"Method": "Initials ICW", "ROC-AUC": initials_auc, "TPR@1%FPR": initials_t1, "TPR@10%FPR": initials_t10})
+        # Initials ICW
+        analyze_watermark_compliance(initials_watermarked, initials_detector, (green_letters,), "Initials ICW")
+        initials_auc, initials_t1, initials_t10 = evaluate_strategy(
+            initials_watermarked, initials_detector, (green_letters,), non_wm_texts, "Initials ICW"
+        )
+        results.append({"Method": "Initials ICW", "ROC-AUC": initials_auc, "TPR@1%FPR": initials_t1, "TPR@10%FPR": initials_t10})
 
-    # Lexical ICW
-    analyze_watermark_compliance(lexical_watermarked, lexical_detector, (green_words,), "Lexical ICW")
-    lexical_auc, lexical_t1, lexical_t10 = evaluate_strategy(
-        lexical_watermarked, lexical_detector, (green_words,), non_wm_texts, "Lexical ICW"
-    )
-    results.append({"Method": "Lexical ICW", "ROC-AUC": lexical_auc, "TPR@1%FPR": lexical_t1, "TPR@10%FPR": lexical_t10})
+        # Lexical ICW
+        analyze_watermark_compliance(lexical_watermarked, lexical_detector, (green_words,), "Lexical ICW")
+        lexical_auc, lexical_t1, lexical_t10 = evaluate_strategy(
+            lexical_watermarked, lexical_detector, (green_words,), non_wm_texts, "Lexical ICW"
+        )
+        results.append({"Method": "Lexical ICW", "ROC-AUC": lexical_auc, "TPR@1%FPR": lexical_t1, "TPR@10%FPR": lexical_t10})
 
-    # Acrostics ICW
-    analyze_watermark_compliance(acrostics_watermarked, acrostics_detector, (secret_sequence,), "Acrostics ICW")
-    acrostics_auc, acrostics_t1, acrostics_t10 = evaluate_strategy(
-        acrostics_watermarked, acrostics_detector, (secret_sequence,), non_wm_texts, "Acrostics ICW"
-    )
-    results.append({"Method": "Acrostics ICW", "ROC-AUC": acrostics_auc, "TPR@1%FPR": acrostics_t1, "TPR@10%FPR": acrostics_t10})
+        # Acrostics ICW
+        analyze_watermark_compliance(acrostics_watermarked, acrostics_detector, (secret_sequence,), "Acrostics ICW")
+        acrostics_auc, acrostics_t1, acrostics_t10 = evaluate_strategy(
+            acrostics_watermarked, acrostics_detector, (secret_sequence,), non_wm_texts, "Acrostics ICW"
+        )
+        results.append({"Method": "Acrostics ICW", "ROC-AUC": acrostics_auc, "TPR@1%FPR": acrostics_t1, "TPR@10%FPR": acrostics_t10})
 
     # ========================================================================
     # SUMMARY & VISUALIZATION
@@ -944,27 +1118,30 @@ def run_pipeline():
     df = pd.DataFrame(results)
     print("\n" + df.to_string(index=False))
 
-    # Compare to paper's results
-    print("\n" + "="*80)
-    print("COMPARISON TO PAPER (GPT-4o-mini results)")
-    print("="*80)
-    paper_results = {
-        "Unicode ICW": {"ROC-AUC": 1.000, "TPR@1%FPR": 1.000},
-        "Initials ICW": {"ROC-AUC": 0.572, "TPR@1%FPR": 0.006},
-        "Lexical ICW": {"ROC-AUC": 0.910, "TPR@1%FPR": 0.320},
-        "Acrostics ICW": {"ROC-AUC": 0.590, "TPR@1%FPR": 0.036}
-    }
+    if not DISABLE_WM_INSTRUCTION:
+        # Compare to paper's results
+        print("\n" + "="*80)
+        print("COMPARISON TO PAPER (GPT-4o-mini results)")
+        print("="*80)
+        paper_results = {
+            "Unicode ICW": {"ROC-AUC": 1.000, "TPR@1%FPR": 1.000},
+            "Initials ICW": {"ROC-AUC": 0.572, "TPR@1%FPR": 0.006},
+            "Lexical ICW": {"ROC-AUC": 0.910, "TPR@1%FPR": 0.320},
+            "Acrostics ICW": {"ROC-AUC": 0.590, "TPR@1%FPR": 0.036}
+        }
 
-    print("\nMethod          | Your ROC-AUC | Paper ROC-AUC | Your TPR@1% | Paper TPR@1%")
-    print("-" * 75)
-    for method in ["Unicode ICW", "Initials ICW", "Lexical ICW", "Acrostics ICW"]:
-        your_auc = df[df["Method"] == method]["ROC-AUC"].values[0]
-        your_tpr = df[df["Method"] == method]["TPR@1%FPR"].values[0]
-        paper_auc = paper_results[method]["ROC-AUC"]
-        paper_tpr = paper_results[method]["TPR@1%FPR"]
-        print(f"{method:15} | {your_auc:12.4f} | {paper_auc:13.4f} | {your_tpr:11.4f} | {paper_tpr:12.4f}")
+        print("\nMethod          | Your ROC-AUC | Paper ROC-AUC | Your TPR@1% | Paper TPR@1%")
+        print("-" * 75)
+        for method in ["Unicode ICW", "Initials ICW", "Lexical ICW", "Acrostics ICW"]:
+            your_auc = df[df["Method"] == method]["ROC-AUC"].values[0]
+            your_tpr = df[df["Method"] == method]["TPR@1%FPR"].values[0]
+            paper_auc = paper_results[method]["ROC-AUC"]
+            paper_tpr = paper_results[method]["TPR@1%FPR"]
+            print(f"{method:15} | {your_auc:12.4f} | {paper_auc:13.4f} | {your_tpr:11.4f} | {paper_tpr:12.4f}")
 
-    print("\nNote: Paper uses GPT-4o-mini. Your model is smaller, so lower results are expected.")
+        print("\nNote: Paper uses GPT-4o-mini. Your model is smaller, so lower results are expected.")
+    else:
+        print("\nNo-instruction mode: detector-score summaries are reported instead of ROC curves.")
 
     # Save results
     results_file = os.path.join(OUTPUT_DIR, "results.csv")
@@ -972,36 +1149,50 @@ def run_pipeline():
     print(f"\n✓ Results saved to {results_file}")
 
     # Visualizations
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    if DISABLE_WM_INSTRUCTION:
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        ax.bar(df["Method"], df["Mean Score"], yerr=df["Std Score"], capsize=4, color="steelblue")
+        ax.set_ylabel("Detector Mean Score", fontsize=11)
+        ax.set_title("No-Instruction Detector Scores", fontsize=12, fontweight="bold")
+        ax.tick_params(axis='x', rotation=45)
+        ax.grid(axis='y', alpha=0.3)
+        plt.tight_layout()
+        plot_file = os.path.join(OUTPUT_DIR, "icw_detector_scores.png")
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
-    axes[0].set_ylabel("ROC-AUC", fontsize=11)
-    axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
-    axes[0].set_ylim(0, 1)
-    axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.3, label='Random')
-    axes[0].tick_params(axis='x', rotation=45)
-    axes[0].legend()
-    axes[0].grid(axis='y', alpha=0.3)
+        axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
+        axes[0].set_ylabel("ROC-AUC", fontsize=11)
+        axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
+        axes[0].set_ylim(0, 1)
+        axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.3, label='Random')
+        axes[0].tick_params(axis='x', rotation=45)
+        axes[0].legend()
+        axes[0].grid(axis='y', alpha=0.3)
 
-    axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
-    axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
-    axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
-    axes[1].set_ylim(0, 1)
-    axes[1].tick_params(axis='x', rotation=45)
-    axes[1].grid(axis='y', alpha=0.3)
+        axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
+        axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
+        axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
+        axes[1].set_ylim(0, 1)
+        axes[1].tick_params(axis='x', rotation=45)
+        axes[1].grid(axis='y', alpha=0.3)
 
-    axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
-    axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
-    axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
-    axes[2].set_ylim(0, 1)
-    axes[2].tick_params(axis='x', rotation=45)
-    axes[2].grid(axis='y', alpha=0.3)
+        axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
+        axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
+        axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
+        axes[2].set_ylim(0, 1)
+        axes[2].tick_params(axis='x', rotation=45)
+        axes[2].grid(axis='y', alpha=0.3)
 
-    plt.tight_layout()
-    plot_file = os.path.join(OUTPUT_DIR, "icw_evaluation.png")
+        plt.tight_layout()
+        plot_file = os.path.join(OUTPUT_DIR, "icw_evaluation.png")
+
     plt.savefig(plot_file, dpi=150, bbox_inches='tight')
     print(f"✓ Plots saved to {plot_file}")
-    plt.show()
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close(fig)
 
     print("\n" + "="*80)
     print("EVALUATION COMPLETE")
@@ -1009,11 +1200,26 @@ def run_pipeline():
     print(f"\nAll outputs saved to: {OUTPUT_DIR}/")
     print(f"  - generation_log.jsonl (detailed generation logs)")
     print(f"  - results.csv (summary metrics)")
-    print(f"  - icw_evaluation.png (visualization)")
+    if DISABLE_WM_INSTRUCTION:
+        print(f"  - icw_detector_scores.png (visualization)")
+    else:
+        print(f"  - icw_evaluation.png (visualization)")
     print("\n" + "="*80)
     print("INTERPRETATION GUIDE")
     print("="*80)
-    print("""
+    if DISABLE_WM_INSTRUCTION:
+        print("""
+Your results show detector strength without explicit watermark prompts:
+
+Mean Score Interpretation:
+  • Higher mean score = stronger spontaneous watermark signal
+  • Score near 0 = little/no retained watermark behavior
+  • Lower score than baseline = training likely not retaining the scheme
+
+Use this mode for validation/test-style checks after training.
+""")
+    else:
+        print("""
 Your results show watermarking effectiveness for your model:
 
 ROC-AUC Interpretation:
