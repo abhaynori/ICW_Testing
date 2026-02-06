@@ -23,6 +23,7 @@ MEMORY_STRATEGY = os.getenv('ICW_MEMORY_STRATEGY', "4bit")  # Options: "small" (
 TEMPERATURE = float(os.getenv('ICW_TEMPERATURE', '0.7'))
 NUM_SAMPLES = int(os.getenv('ICW_NUM_SAMPLES', '50'))  # Increase to 200+ for more reliable statistics
 OUTPUT_DIR = os.getenv('ICW_OUTPUT_DIR', "outputs")
+DISABLE_WM_INSTRUCTION = os.getenv('ICW_DISABLE_WM_INSTRUCTION', '0').lower() in {"1", "true", "yes"}
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Auto-configure based on memory strategy
@@ -46,6 +47,7 @@ print(f"Memory Strategy: {MEMORY_STRATEGY}")
 print(f"Model: {MODEL_NAME}")
 print(f"Temperature: {TEMPERATURE}")
 print(f"Samples: {NUM_SAMPLES}")
+print(f"Watermark Instructions Disabled: {DISABLE_WM_INSTRUCTION}")
 print(f"{'='*80}")
 
 # Warning for small models
@@ -531,20 +533,24 @@ green_words = {
 VOCAB_SIZE = 10857  # Full vocabulary size from paper
 gamma_lexical = len(green_words) / VOCAB_SIZE
 
+LEXICAL_SYSTEM_PROMPT = None
+
 def lexical_embed_prompt(query):
     """Paper prompt: Maximize use of words from green word list."""
-    word_list = ', '.join(sorted(list(green_words)))
-    
-    system_msg = (
-        f"### Green Word List: {word_list}\n\n"
-        "### Command:\n"
-        "You are given a predefined Green Word List. For each user query, generate a response that is:\n"
-        "1. Clear & Coherent: Easy to follow and logically organized.\n"
-        "2. Accurate & Concrete: Provides precise facts, examples, or steps.\n"
-        "3. Contextually Relevant: Directly addresses the user's intent and context.\n"
-        "4. 'Green Word' Enriched (Most Important!): Try your best to seamlessly incorporate as many "
-        "words from the Green Word List as possible — without compromising text quality."
-    )
+    global LEXICAL_SYSTEM_PROMPT
+    if LEXICAL_SYSTEM_PROMPT is None:
+        word_list = ', '.join(sorted(list(green_words)))
+        LEXICAL_SYSTEM_PROMPT = (
+            f"### Green Word List: {word_list}\n\n"
+            "### Command:\n"
+            "You are given a predefined Green Word List. For each user query, generate a response that is:\n"
+            "1. Clear & Coherent: Easy to follow and logically organized.\n"
+            "2. Accurate & Concrete: Provides precise facts, examples, or steps.\n"
+            "3. Contextually Relevant: Directly addresses the user's intent and context.\n"
+            "4. 'Green Word' Enriched (Most Important!): Try your best to seamlessly incorporate as many "
+            "words from the Green Word List as possible — without compromising text quality."
+        )
+    system_msg = LEXICAL_SYSTEM_PROMPT
     return [
         {"role": "system", "content": system_msg},
         {"role": "user", "content": query}
@@ -643,6 +649,26 @@ def acrostics_detector(text, secret_sequence):
     z_score = (mu - actual_distance) / sigma
     return z_score
 
+def build_messages_for_method(method, query, disable_instruction=False):
+    """Build messages for a method, optionally disabling watermark instructions."""
+    if disable_instruction:
+        return [
+            {"role": "system", "content": "You are a helpful assistant. Provide clear, informative answers."},
+            {"role": "user", "content": query}
+        ]
+
+    prompt_map = {
+        "unicode": unicode_embed_prompt,
+        "initials": initials_embed_prompt,
+        "lexical": lexical_embed_prompt,
+        "acrostics": acrostics_embed_prompt,
+    }
+
+    if method not in prompt_map:
+        raise ValueError(f"Unknown method: {method}")
+
+    return prompt_map[method](query)
+
 # ============================================================================
 # TEXT GENERATION
 # ============================================================================
@@ -662,28 +688,28 @@ for i, query in enumerate(eli5):
         print(f"Progress: {i+1}/{NUM_SAMPLES}")
     
     # Unicode ICW
-    messages = unicode_embed_prompt(query)
+    messages = build_messages_for_method("unicode", query, DISABLE_WM_INSTRUCTION)
     response = generate_response(messages)
     unicode_watermarked.append(response)
     prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
     log_generation(query, prompt_str, response, "Unicode ICW")
     
     # Initials ICW
-    messages = initials_embed_prompt(query)
+    messages = build_messages_for_method("initials", query, DISABLE_WM_INSTRUCTION)
     response = generate_response(messages)
     initials_watermarked.append(response)
     prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
     log_generation(query, prompt_str, response, "Initials ICW")
     
     # Lexical ICW
-    messages = lexical_embed_prompt(query)
+    messages = build_messages_for_method("lexical", query, DISABLE_WM_INSTRUCTION)
     response = generate_response(messages)
     lexical_watermarked.append(response)
     prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
     log_generation(query, prompt_str, response, "Lexical ICW")
     
     # Acrostics ICW
-    messages = acrostics_embed_prompt(query)
+    messages = build_messages_for_method("acrostics", query, DISABLE_WM_INSTRUCTION)
     response = generate_response(messages)
     acrostics_watermarked.append(response)
     prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"

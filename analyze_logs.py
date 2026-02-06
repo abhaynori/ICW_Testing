@@ -7,11 +7,27 @@ import json
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
+import pandas as pd
 
-def analyze_mixed_logs():
-    # Read all logs
-    with open('outputs/generation_log.jsonl', 'r') as f:
-        logs = [json.loads(line) for line in f]
+DEFAULT_LOG_PATH = "outputs/generation_log.jsonl"
+
+
+def load_logs(filepath=DEFAULT_LOG_PATH):
+    """Load all log entries from JSONL file."""
+    logs = []
+    try:
+        with open(filepath) as f:
+            for line in f:
+                logs.append(json.loads(line))
+    except FileNotFoundError:
+        print(f"Log file not found: {filepath}")
+        return []
+    return logs
+
+def analyze_mixed_logs(logs):
+    if not logs:
+        print("No logs found. Run main.py first to generate data.")
+        return
 
     print(f"Total log entries: {len(logs)}\n")
 
@@ -88,19 +104,6 @@ def analyze_mixed_logs():
     print("2. Run fresh: python3 main.py")
     print("3. This will generate clean, consistent data")
 
-if __name__ == "__main__":
-    analyze_mixed_logs()
-    """Load all log entries from JSONL file."""
-    logs = []
-    try:
-        with open(filepath) as f:
-            for line in f:
-                logs.append(json.loads(line))
-    except FileNotFoundError:
-        print(f"Log file not found: {filepath}")
-        return []
-    return logs
-
 def analyze_by_method(logs):
     """Group and analyze logs by ICW method."""
     by_method = defaultdict(list)
@@ -161,18 +164,8 @@ def search_logs(logs, keyword, field='output'):
         print()
 
 if __name__ == "__main__":
-    # Load logs
     logs = load_logs()
-    
     if not logs:
         print("No logs found. Run main.py first to generate data.")
     else:
-        print(f"Loaded {len(logs)} log entries")
-        
-        # Run analyses
-        analyze_by_method(logs)
-        compare_outputs(logs, query_idx=0)
-        export_to_csv(logs)
-        
-        # Example search
-        # search_logs(logs, "example", field='output')
+        analyze_mixed_logs(logs)

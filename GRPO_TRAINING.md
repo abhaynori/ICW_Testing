@@ -50,6 +50,7 @@ This will:
 - Generate baseline statistics
 - Train for 3 epochs using detector scores as rewards
 - Save the trained model to `grpo_models/`
+- Run evaluation on validation/test splits without watermark instructions (default)
 
 ### 2. Test the Trained Model
 
@@ -59,6 +60,9 @@ ls grpo_models/
 
 # Test it (replace with your actual path)
 python cli.py --model-path grpo_models/unicode_small_20231210_143022/final_model --samples 50
+
+# Evaluate without watermark instructions (validation/test style)
+python cli.py --model-path grpo_models/unicode_small_20231210_143022/final_model --samples 50 --no-wm-instruction
 ```
 
 ### 3. Compare Base vs Trained
@@ -91,6 +95,9 @@ python grpo_train.py [OPTIONS]
 | `--batch-size` | 4 | Training batch size |
 | `--learning-rate` | 1e-5 | Learning rate |
 | `--output-dir` | grpo_models | Output directory |
+| `--eval-splits` | validation,test | Comma-separated splits to evaluate post-training |
+| `--eval-samples` | 50 | Samples per evaluation split |
+| `--eval-no-instruction` | false | Disable watermarking instructions during eval |
 
 ### Important Notes
 

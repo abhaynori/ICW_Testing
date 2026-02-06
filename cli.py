@@ -58,7 +58,7 @@ def list_models():
     print("  python cli.py --list-models")
     print()
 
-def run_experiment(model_strategy, temperature, num_samples, output_dir, model_path=None):
+def run_experiment(model_strategy, temperature, num_samples, output_dir, model_path=None, disable_wm_instruction=False):
     """Run the ICW experiment with specified configuration."""
 
     # Validate inputs
@@ -81,6 +81,7 @@ def run_experiment(model_strategy, temperature, num_samples, output_dir, model_p
     os.environ['ICW_TEMPERATURE'] = str(temperature)
     os.environ['ICW_NUM_SAMPLES'] = str(num_samples)
     os.environ['ICW_OUTPUT_DIR'] = output_dir
+    os.environ['ICW_DISABLE_WM_INSTRUCTION'] = '1' if disable_wm_instruction else '0'
 
     # If using a custom trained model path
     if model_path:
@@ -176,6 +177,12 @@ Examples:
         help='Path to custom trained model (e.g., GRPO-trained model)'
     )
 
+    parser.add_argument(
+        '--no-wm-instruction',
+        action='store_true',
+        help='Disable watermarking instructions for evaluation (useful for validation/test)'
+    )
+
     args = parser.parse_args()
 
     if args.list_models:
@@ -187,7 +194,8 @@ Examples:
         temperature=args.temperature,
         num_samples=args.samples,
         output_dir=args.output,
-        model_path=args.model_path
+        model_path=args.model_path,
+        disable_wm_instruction=args.no_wm_instruction
     )
 
 if __name__ == "__main__":

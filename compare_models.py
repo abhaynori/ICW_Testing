@@ -19,7 +19,7 @@ from datetime import datetime
 import glob
 
 
-def run_comparison(base_model, trained_model_path, method, num_samples=50):
+def run_comparison(base_model, trained_model_path, method, num_samples=50, disable_wm_instruction=False):
     """
     Run comparison between base and trained models.
 
@@ -56,6 +56,8 @@ def run_comparison(base_model, trained_model_path, method, num_samples=50):
         "--samples", str(num_samples),
         "--output", base_output_dir
     ]
+    if disable_wm_instruction:
+        base_cmd.append("--no-wm-instruction")
 
     try:
         subprocess.run(base_cmd, check=True)
@@ -76,6 +78,8 @@ def run_comparison(base_model, trained_model_path, method, num_samples=50):
         "--samples", str(num_samples),
         "--output", trained_output_dir
     ]
+    if disable_wm_instruction:
+        trained_cmd.append("--no-wm-instruction")
 
     try:
         subprocess.run(trained_cmd, check=True)
@@ -103,6 +107,8 @@ def run_comparison(base_model, trained_model_path, method, num_samples=50):
     comparison_data = []
 
     for method_name in base_results["Method"].unique():
+        if method_name.lower().startswith(method) is False:
+            continue
         base_row = base_results[base_results["Method"] == method_name].iloc[0]
         trained_row = trained_results[trained_results["Method"] == method_name].iloc[0]
 
@@ -216,6 +222,12 @@ Examples:
         help='Number of test samples (default: 50)'
     )
 
+    parser.add_argument(
+        '--no-wm-instruction',
+        action='store_true',
+        help='Disable watermarking instructions for evaluation (validation/test style)'
+    )
+
     args = parser.parse_args()
 
     # Resolve glob pattern if needed
@@ -239,7 +251,8 @@ Examples:
         base_model=args.base,
         trained_model_path=trained_model_path,
         method=args.method,
-        num_samples=args.samples
+        num_samples=args.samples,
+        disable_wm_instruction=args.no_wm_instruction
     )
 
     if result is not None:

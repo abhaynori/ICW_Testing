@@ -16,6 +16,9 @@ python grpo_train.py --model small --method acrostics --epochs 3 --samples 100
 ### Step 2: Test
 ```bash
 python cli.py --model-path "grpo_models/acrostics_small_*/final_model" --samples 50
+
+# Evaluate without watermark instructions (validation/test style)
+python cli.py --model-path "grpo_models/acrostics_small_*/final_model" --samples 50 --no-wm-instruction
 ```
 
 ### Step 3: Compare
