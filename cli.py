@@ -112,8 +112,9 @@ def run_experiment(model_strategy, temperature, num_samples, output_dir, model_p
     sys.argv = ['main.py']
 
     try:
-        # Import main (this will execute the script)
-        import main
+        # Import and run main pipeline
+        from main import run_pipeline
+        run_pipeline()
     except Exception as e:
         print(f"\n{'='*80}")
         print(f"ERROR: Experiment failed")

@@ -2,9 +2,17 @@
 Quick diagnostic: Check for mixed/broken data in log file
 """
 import json
+import os
+import sys
 from collections import Counter
 
-with open('outputs/generation_log.jsonl', 'r') as f:
+log_path = 'outputs/generation_log.jsonl'
+if not os.path.exists(log_path):
+    print(f"Log file not found: {log_path}")
+    print("Run main.py first to generate data.")
+    sys.exit(1)
+
+with open(log_path, 'r') as f:
     logs = [json.loads(line) for line in f]
 
 print(f"\n{'='*70}")

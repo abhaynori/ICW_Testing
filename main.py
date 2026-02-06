@@ -14,117 +14,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import warnings
 
-nltk.download('averaged_perceptron_tagger', quiet=True)
-nltk.download('punkt_tab', quiet=True)
+def _ensure_nltk_data():
+    """Download NLTK data only if not already present."""
+    for resource, name in [('taggers/averaged_perceptron_tagger', 'averaged_perceptron_tagger'),
+                           ('tokenizers/punkt_tab', 'punkt_tab')]:
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            nltk.download(name, quiet=True)
+
+_ensure_nltk_data()
 
 # ===== CONFIGURATION =====
-# Read from environment variables if set (for CLI usage), otherwise use defaults
-MEMORY_STRATEGY = os.getenv('ICW_MEMORY_STRATEGY', "4bit")  # Options: "small" (1.5B), "4bit" (7B), "8bit" (7B), "full" (7B)
-TEMPERATURE = float(os.getenv('ICW_TEMPERATURE', '0.7'))
-NUM_SAMPLES = int(os.getenv('ICW_NUM_SAMPLES', '50'))  # Increase to 200+ for more reliable statistics
-OUTPUT_DIR = os.getenv('ICW_OUTPUT_DIR', "outputs")
-DISABLE_WM_INSTRUCTION = os.getenv('ICW_DISABLE_WM_INSTRUCTION', '0').lower() in {"1", "true", "yes"}
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Auto-configure based on memory strategy
+# These are read at import time but only used by the main() function
+# and by log_generation / generate_response when running as a script.
 from memory_config import get_model_config
-
-# Check if a custom model path is provided (e.g., GRPO-trained model)
-CUSTOM_MODEL_PATH = os.getenv('ICW_MODEL_PATH', None)
-
-if CUSTOM_MODEL_PATH:
-    MODEL_NAME = CUSTOM_MODEL_PATH
-    config = {"model_name": MODEL_NAME, "device_map": "auto"}
-    print(f"Using custom trained model: {MODEL_NAME}")
-else:
-    config = get_model_config(MEMORY_STRATEGY)
-    MODEL_NAME = config["model_name"]
-
-print(f"\n{'='*80}")
-print(f"ICW WATERMARKING EVALUATION (Paper-Accurate Implementation)")
-print(f"{'='*80}")
-print(f"Memory Strategy: {MEMORY_STRATEGY}")
-print(f"Model: {MODEL_NAME}")
-print(f"Temperature: {TEMPERATURE}")
-print(f"Samples: {NUM_SAMPLES}")
-print(f"Watermark Instructions Disabled: {DISABLE_WM_INSTRUCTION}")
-print(f"{'='*80}")
-
-# Warning for small models
-if "1.5B" in MODEL_NAME or "1.5b" in MODEL_NAME:
-    print(f"\n⚠️  WARNING: Using a 1.5B model")
-    print(f"   The paper shows that even GPT-4o-mini struggles with some ICW methods.")
-    print(f"   Expected results:")
-    print(f"   - Unicode ICW: Will likely fail (model can't insert actual Unicode)")
-    print(f"   - Initials ICW: Will likely fail (requires strong instruction-following)")
-    print(f"   - Lexical ICW: Will likely fail (can't track 36-word list)")
-    print(f"   - Acrostics ICW: May show weak signal (easiest task)")
-    print(f"\n   For better results, use MEMORY_STRATEGY='4bit' for 7B model")
-print(f"{'='*80}\n")
-
-# Load model and tokenizer
-print("Loading model...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-
-model_kwargs = {
-    "device_map": config.get("device_map", "auto"),
-    "trust_remote_code": True,
-    "low_cpu_mem_usage": True
-}
-
-if config.get("quantization"):
-    model_kwargs["quantization_config"] = config["quantization"]
-elif config.get("dtype"):
-    model_kwargs["torch_dtype"] = config["dtype"]
-
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **model_kwargs)
-
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-print("✓ Model loaded successfully!\n")
-
-# Generation configuration
-generation_config = {
-    "max_new_tokens": 500,
-    "min_new_tokens": 100,
-    "do_sample": True,
-    "temperature": TEMPERATURE,
-    "top_p": 0.9,
-    "pad_token_id": tokenizer.pad_token_id,
-    "use_cache": True,  # Enable KV cache for faster generation
-}
-
-def generate_response(messages):
-    """Generate response using chat template."""
-    input_ids = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        return_tensors="pt"
-    ).to(model.device)
-    
-    outputs = model.generate(input_ids, **generation_config)
-    response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
-    return response
-
-def log_generation(query, prompt, output, method, filename="generation_log.jsonl"):
-    """Log generation to file."""
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "method": method,
-        "model": MODEL_NAME,
-        "temperature": TEMPERATURE,
-        "query": query,
-        "prompt": prompt,
-        "output": output
-    }
-    with open(os.path.join(OUTPUT_DIR, filename), "a") as f:
-        f.write(json.dumps(log_entry) + "\n")
-
-# Load dataset
-print("Loading dataset...")
-eli5 = load_dataset("sentence-transformers/eli5", "pair", split="train")["question"][:NUM_SAMPLES]
-print(f"✓ Loaded {len(eli5)} questions\n")
 
 # ============================================================================
 # WATERMARKING STRATEGIES (Paper-Accurate)
@@ -670,64 +574,6 @@ def build_messages_for_method(method, query, disable_instruction=False):
     return prompt_map[method](query)
 
 # ============================================================================
-# TEXT GENERATION
-# ============================================================================
-
-print("="*80)
-print("GENERATING WATERMARKED TEXT")
-print("="*80)
-
-unicode_watermarked = []
-initials_watermarked = []
-lexical_watermarked = []
-acrostics_watermarked = []
-non_wm_texts = []
-
-for i, query in enumerate(eli5):
-    if (i + 1) % 10 == 0:
-        print(f"Progress: {i+1}/{NUM_SAMPLES}")
-    
-    # Unicode ICW
-    messages = build_messages_for_method("unicode", query, DISABLE_WM_INSTRUCTION)
-    response = generate_response(messages)
-    unicode_watermarked.append(response)
-    prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-    log_generation(query, prompt_str, response, "Unicode ICW")
-    
-    # Initials ICW
-    messages = build_messages_for_method("initials", query, DISABLE_WM_INSTRUCTION)
-    response = generate_response(messages)
-    initials_watermarked.append(response)
-    prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-    log_generation(query, prompt_str, response, "Initials ICW")
-    
-    # Lexical ICW
-    messages = build_messages_for_method("lexical", query, DISABLE_WM_INSTRUCTION)
-    response = generate_response(messages)
-    lexical_watermarked.append(response)
-    prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-    log_generation(query, prompt_str, response, "Lexical ICW")
-    
-    # Acrostics ICW
-    messages = build_messages_for_method("acrostics", query, DISABLE_WM_INSTRUCTION)
-    response = generate_response(messages)
-    acrostics_watermarked.append(response)
-    prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-    log_generation(query, prompt_str, response, "Acrostics ICW")
-    
-    # Non-watermarked baseline
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant. Provide clear, informative answers."},
-        {"role": "user", "content": query}
-    ]
-    response = generate_response(messages)
-    non_wm_texts.append(response)
-    prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
-    log_generation(query, prompt_str, response, "Non-watermarked")
-
-print(f"✓ Generated {NUM_SAMPLES} samples for each method\n")
-
-# ============================================================================
 # COMPLIANCE ANALYSIS
 # ============================================================================
 
@@ -856,125 +702,318 @@ def evaluate_strategy(wm_texts, detector, detector_args, non_wm_texts, method_na
     
     return auc, tpr_at_1fpr, tpr_at_10fpr
 
-# ============================================================================
-# RUN EVALUATIONS
-# ============================================================================
-
-print("\n" + "="*80)
-print("EVALUATION RESULTS")
-print("="*80)
-
-results = []
-
-# Unicode ICW
-analyze_watermark_compliance(unicode_watermarked, unicode_detector, (), "Unicode ICW")
-unicode_auc, unicode_t1, unicode_t10 = evaluate_strategy(
-    unicode_watermarked, unicode_detector, (), non_wm_texts, "Unicode ICW"
-)
-results.append({"Method": "Unicode ICW", "ROC-AUC": unicode_auc, "TPR@1%FPR": unicode_t1, "TPR@10%FPR": unicode_t10})
-
-# Initials ICW
-analyze_watermark_compliance(initials_watermarked, initials_detector, (green_letters,), "Initials ICW")
-initials_auc, initials_t1, initials_t10 = evaluate_strategy(
-    initials_watermarked, initials_detector, (green_letters,), non_wm_texts, "Initials ICW"
-)
-results.append({"Method": "Initials ICW", "ROC-AUC": initials_auc, "TPR@1%FPR": initials_t1, "TPR@10%FPR": initials_t10})
-
-# Lexical ICW
-analyze_watermark_compliance(lexical_watermarked, lexical_detector, (green_words,), "Lexical ICW")
-lexical_auc, lexical_t1, lexical_t10 = evaluate_strategy(
-    lexical_watermarked, lexical_detector, (green_words,), non_wm_texts, "Lexical ICW"
-)
-results.append({"Method": "Lexical ICW", "ROC-AUC": lexical_auc, "TPR@1%FPR": lexical_t1, "TPR@10%FPR": lexical_t10})
-
-# Acrostics ICW
-analyze_watermark_compliance(acrostics_watermarked, acrostics_detector, (secret_sequence,), "Acrostics ICW")
-acrostics_auc, acrostics_t1, acrostics_t10 = evaluate_strategy(
-    acrostics_watermarked, acrostics_detector, (secret_sequence,), non_wm_texts, "Acrostics ICW"
-)
-results.append({"Method": "Acrostics ICW", "ROC-AUC": acrostics_auc, "TPR@1%FPR": acrostics_t1, "TPR@10%FPR": acrostics_t10})
 
 # ============================================================================
-# SUMMARY & VISUALIZATION
+# MAIN ENTRY POINT
 # ============================================================================
 
-print("\n" + "="*80)
-print("SUMMARY TABLE")
-print("="*80)
+def run_pipeline():
+    """Run the full ICW watermarking evaluation pipeline."""
 
-df = pd.DataFrame(results)
-print("\n" + df.to_string(index=False))
+    # ===== CONFIGURATION =====
+    MEMORY_STRATEGY = os.getenv('ICW_MEMORY_STRATEGY', "4bit")
+    TEMPERATURE = float(os.getenv('ICW_TEMPERATURE', '0.7'))
+    NUM_SAMPLES = int(os.getenv('ICW_NUM_SAMPLES', '50'))
+    OUTPUT_DIR = os.getenv('ICW_OUTPUT_DIR', "outputs")
+    DISABLE_WM_INSTRUCTION = os.getenv('ICW_DISABLE_WM_INSTRUCTION', '0').lower() in {"1", "true", "yes"}
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Compare to paper's results
-print("\n" + "="*80)
-print("COMPARISON TO PAPER (GPT-4o-mini results)")
-print("="*80)
-paper_results = {
-    "Unicode ICW": {"ROC-AUC": 1.000, "TPR@1%FPR": 1.000},
-    "Initials ICW": {"ROC-AUC": 0.572, "TPR@1%FPR": 0.006},
-    "Lexical ICW": {"ROC-AUC": 0.910, "TPR@1%FPR": 0.320},
-    "Acrostics ICW": {"ROC-AUC": 0.590, "TPR@1%FPR": 0.036}
-}
+    # Check if a custom model path is provided (e.g., GRPO-trained model)
+    CUSTOM_MODEL_PATH = os.getenv('ICW_MODEL_PATH', None)
 
-print("\nMethod          | Your ROC-AUC | Paper ROC-AUC | Your TPR@1% | Paper TPR@1%")
-print("-" * 75)
-for method in ["Unicode ICW", "Initials ICW", "Lexical ICW", "Acrostics ICW"]:
-    your_auc = df[df["Method"] == method]["ROC-AUC"].values[0]
-    your_tpr = df[df["Method"] == method]["TPR@1%FPR"].values[0]
-    paper_auc = paper_results[method]["ROC-AUC"]
-    paper_tpr = paper_results[method]["TPR@1%FPR"]
-    print(f"{method:15} | {your_auc:12.4f} | {paper_auc:13.4f} | {your_tpr:11.4f} | {paper_tpr:12.4f}")
+    if CUSTOM_MODEL_PATH:
+        MODEL_NAME = CUSTOM_MODEL_PATH
+        config = {"model_name": MODEL_NAME, "device_map": "auto"}
+        print(f"Using custom trained model: {MODEL_NAME}")
+    else:
+        config = get_model_config(MEMORY_STRATEGY)
+        MODEL_NAME = config["model_name"]
 
-print("\nNote: Paper uses GPT-4o-mini. Your model is smaller, so lower results are expected.")
+    print(f"\n{'='*80}")
+    print(f"ICW WATERMARKING EVALUATION (Paper-Accurate Implementation)")
+    print(f"{'='*80}")
+    print(f"Memory Strategy: {MEMORY_STRATEGY}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Temperature: {TEMPERATURE}")
+    print(f"Samples: {NUM_SAMPLES}")
+    print(f"Watermark Instructions Disabled: {DISABLE_WM_INSTRUCTION}")
+    print(f"{'='*80}")
 
-# Save results
-results_file = os.path.join(OUTPUT_DIR, "results.csv")
-df.to_csv(results_file, index=False)
-print(f"\n✓ Results saved to {results_file}")
+    # Warning for small models
+    if "1.5B" in MODEL_NAME or "1.5b" in MODEL_NAME:
+        print(f"\n⚠️  WARNING: Using a 1.5B model")
+        print(f"   The paper shows that even GPT-4o-mini struggles with some ICW methods.")
+        print(f"   Expected results:")
+        print(f"   - Unicode ICW: Will likely fail (model can't insert actual Unicode)")
+        print(f"   - Initials ICW: Will likely fail (requires strong instruction-following)")
+        print(f"   - Lexical ICW: Will likely fail (can't track 36-word list)")
+        print(f"   - Acrostics ICW: May show weak signal (easiest task)")
+        print(f"\n   For better results, use MEMORY_STRATEGY='4bit' for 7B model")
+    print(f"{'='*80}\n")
 
-# Visualizations
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    # Load model and tokenizer
+    print("Loading model...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 
-axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
-axes[0].set_ylabel("ROC-AUC", fontsize=11)
-axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
-axes[0].set_ylim(0, 1)
-axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.3, label='Random')
-axes[0].tick_params(axis='x', rotation=45)
-axes[0].legend()
-axes[0].grid(axis='y', alpha=0.3)
+    model_kwargs = {
+        "device_map": config.get("device_map", "auto"),
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True
+    }
 
-axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
-axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
-axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
-axes[1].set_ylim(0, 1)
-axes[1].tick_params(axis='x', rotation=45)
-axes[1].grid(axis='y', alpha=0.3)
+    if config.get("quantization"):
+        model_kwargs["quantization_config"] = config["quantization"]
+    elif config.get("dtype"):
+        model_kwargs["torch_dtype"] = config["dtype"]
 
-axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
-axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
-axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
-axes[2].set_ylim(0, 1)
-axes[2].tick_params(axis='x', rotation=45)
-axes[2].grid(axis='y', alpha=0.3)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **model_kwargs)
 
-plt.tight_layout()
-plot_file = os.path.join(OUTPUT_DIR, "icw_evaluation.png")
-plt.savefig(plot_file, dpi=150, bbox_inches='tight')
-print(f"✓ Plots saved to {plot_file}")
-plt.show()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-print("\n" + "="*80)
-print("EVALUATION COMPLETE")
-print("="*80)
-print(f"\nAll outputs saved to: {OUTPUT_DIR}/")
-print(f"  - generation_log.jsonl (detailed generation logs)")
-print(f"  - results.csv (summary metrics)")
-print(f"  - icw_evaluation.png (visualization)")
-print("\n" + "="*80)
-print("INTERPRETATION GUIDE")
-print("="*80)
-print("""
+    print("✓ Model loaded successfully!\n")
+
+    # Generation configuration
+    generation_config = {
+        "max_new_tokens": 500,
+        "min_new_tokens": 100,
+        "do_sample": True,
+        "temperature": TEMPERATURE,
+        "top_p": 0.9,
+        "pad_token_id": tokenizer.pad_token_id,
+        "use_cache": True,
+    }
+
+    def generate_response(messages):
+        """Generate response using chat template."""
+        input_ids = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        ).to(model.device)
+
+        outputs = model.generate(input_ids, **generation_config)
+        response = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True)
+        return response
+
+    # Buffered log writer to reduce per-sample disk I/O
+    log_buffer = []
+
+    def log_generation(query, prompt, output, method, filename="generation_log.jsonl"):
+        """Buffer log entries and flush periodically."""
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "method": method,
+            "model": MODEL_NAME,
+            "temperature": TEMPERATURE,
+            "query": query,
+            "prompt": prompt,
+            "output": output
+        }
+        log_buffer.append((os.path.join(OUTPUT_DIR, filename), log_entry))
+        # Flush every 50 entries
+        if len(log_buffer) >= 50:
+            flush_logs()
+
+    def flush_logs():
+        """Write buffered log entries to disk."""
+        if not log_buffer:
+            return
+        # Group by filename
+        by_file = {}
+        for filepath, entry in log_buffer:
+            by_file.setdefault(filepath, []).append(entry)
+        for filepath, entries in by_file.items():
+            with open(filepath, "a") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+        log_buffer.clear()
+
+    # Load dataset
+    print("Loading dataset...")
+    eli5 = load_dataset("sentence-transformers/eli5", "pair", split="train")["question"][:NUM_SAMPLES]
+    print(f"✓ Loaded {len(eli5)} questions\n")
+
+    # ========================================================================
+    # TEXT GENERATION
+    # ========================================================================
+
+    print("="*80)
+    print("GENERATING WATERMARKED TEXT")
+    print("="*80)
+
+    unicode_watermarked = []
+    initials_watermarked = []
+    lexical_watermarked = []
+    acrostics_watermarked = []
+    non_wm_texts = []
+
+    for i, query in enumerate(eli5):
+        if (i + 1) % 10 == 0:
+            print(f"Progress: {i+1}/{NUM_SAMPLES}")
+
+        # Unicode ICW
+        messages = build_messages_for_method("unicode", query, DISABLE_WM_INSTRUCTION)
+        response = generate_response(messages)
+        unicode_watermarked.append(response)
+        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+        log_generation(query, prompt_str, response, "Unicode ICW")
+
+        # Initials ICW
+        messages = build_messages_for_method("initials", query, DISABLE_WM_INSTRUCTION)
+        response = generate_response(messages)
+        initials_watermarked.append(response)
+        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+        log_generation(query, prompt_str, response, "Initials ICW")
+
+        # Lexical ICW
+        messages = build_messages_for_method("lexical", query, DISABLE_WM_INSTRUCTION)
+        response = generate_response(messages)
+        lexical_watermarked.append(response)
+        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+        log_generation(query, prompt_str, response, "Lexical ICW")
+
+        # Acrostics ICW
+        messages = build_messages_for_method("acrostics", query, DISABLE_WM_INSTRUCTION)
+        response = generate_response(messages)
+        acrostics_watermarked.append(response)
+        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+        log_generation(query, prompt_str, response, "Acrostics ICW")
+
+        # Non-watermarked baseline
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant. Provide clear, informative answers."},
+            {"role": "user", "content": query}
+        ]
+        response = generate_response(messages)
+        non_wm_texts.append(response)
+        prompt_str = f"System: {messages[0]['content']}\nUser: {messages[1]['content']}"
+        log_generation(query, prompt_str, response, "Non-watermarked")
+
+    # Flush remaining log entries
+    flush_logs()
+
+    print(f"✓ Generated {NUM_SAMPLES} samples for each method\n")
+
+    # ========================================================================
+    # RUN EVALUATIONS
+    # ========================================================================
+
+    print("\n" + "="*80)
+    print("EVALUATION RESULTS")
+    print("="*80)
+
+    results = []
+
+    # Unicode ICW
+    analyze_watermark_compliance(unicode_watermarked, unicode_detector, (), "Unicode ICW")
+    unicode_auc, unicode_t1, unicode_t10 = evaluate_strategy(
+        unicode_watermarked, unicode_detector, (), non_wm_texts, "Unicode ICW"
+    )
+    results.append({"Method": "Unicode ICW", "ROC-AUC": unicode_auc, "TPR@1%FPR": unicode_t1, "TPR@10%FPR": unicode_t10})
+
+    # Initials ICW
+    analyze_watermark_compliance(initials_watermarked, initials_detector, (green_letters,), "Initials ICW")
+    initials_auc, initials_t1, initials_t10 = evaluate_strategy(
+        initials_watermarked, initials_detector, (green_letters,), non_wm_texts, "Initials ICW"
+    )
+    results.append({"Method": "Initials ICW", "ROC-AUC": initials_auc, "TPR@1%FPR": initials_t1, "TPR@10%FPR": initials_t10})
+
+    # Lexical ICW
+    analyze_watermark_compliance(lexical_watermarked, lexical_detector, (green_words,), "Lexical ICW")
+    lexical_auc, lexical_t1, lexical_t10 = evaluate_strategy(
+        lexical_watermarked, lexical_detector, (green_words,), non_wm_texts, "Lexical ICW"
+    )
+    results.append({"Method": "Lexical ICW", "ROC-AUC": lexical_auc, "TPR@1%FPR": lexical_t1, "TPR@10%FPR": lexical_t10})
+
+    # Acrostics ICW
+    analyze_watermark_compliance(acrostics_watermarked, acrostics_detector, (secret_sequence,), "Acrostics ICW")
+    acrostics_auc, acrostics_t1, acrostics_t10 = evaluate_strategy(
+        acrostics_watermarked, acrostics_detector, (secret_sequence,), non_wm_texts, "Acrostics ICW"
+    )
+    results.append({"Method": "Acrostics ICW", "ROC-AUC": acrostics_auc, "TPR@1%FPR": acrostics_t1, "TPR@10%FPR": acrostics_t10})
+
+    # ========================================================================
+    # SUMMARY & VISUALIZATION
+    # ========================================================================
+
+    print("\n" + "="*80)
+    print("SUMMARY TABLE")
+    print("="*80)
+
+    df = pd.DataFrame(results)
+    print("\n" + df.to_string(index=False))
+
+    # Compare to paper's results
+    print("\n" + "="*80)
+    print("COMPARISON TO PAPER (GPT-4o-mini results)")
+    print("="*80)
+    paper_results = {
+        "Unicode ICW": {"ROC-AUC": 1.000, "TPR@1%FPR": 1.000},
+        "Initials ICW": {"ROC-AUC": 0.572, "TPR@1%FPR": 0.006},
+        "Lexical ICW": {"ROC-AUC": 0.910, "TPR@1%FPR": 0.320},
+        "Acrostics ICW": {"ROC-AUC": 0.590, "TPR@1%FPR": 0.036}
+    }
+
+    print("\nMethod          | Your ROC-AUC | Paper ROC-AUC | Your TPR@1% | Paper TPR@1%")
+    print("-" * 75)
+    for method in ["Unicode ICW", "Initials ICW", "Lexical ICW", "Acrostics ICW"]:
+        your_auc = df[df["Method"] == method]["ROC-AUC"].values[0]
+        your_tpr = df[df["Method"] == method]["TPR@1%FPR"].values[0]
+        paper_auc = paper_results[method]["ROC-AUC"]
+        paper_tpr = paper_results[method]["TPR@1%FPR"]
+        print(f"{method:15} | {your_auc:12.4f} | {paper_auc:13.4f} | {your_tpr:11.4f} | {paper_tpr:12.4f}")
+
+    print("\nNote: Paper uses GPT-4o-mini. Your model is smaller, so lower results are expected.")
+
+    # Save results
+    results_file = os.path.join(OUTPUT_DIR, "results.csv")
+    df.to_csv(results_file, index=False)
+    print(f"\n✓ Results saved to {results_file}")
+
+    # Visualizations
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
+    axes[0].set_ylabel("ROC-AUC", fontsize=11)
+    axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
+    axes[0].set_ylim(0, 1)
+    axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.3, label='Random')
+    axes[0].tick_params(axis='x', rotation=45)
+    axes[0].legend()
+    axes[0].grid(axis='y', alpha=0.3)
+
+    axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
+    axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
+    axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
+    axes[1].set_ylim(0, 1)
+    axes[1].tick_params(axis='x', rotation=45)
+    axes[1].grid(axis='y', alpha=0.3)
+
+    axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
+    axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
+    axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
+    axes[2].set_ylim(0, 1)
+    axes[2].tick_params(axis='x', rotation=45)
+    axes[2].grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    plot_file = os.path.join(OUTPUT_DIR, "icw_evaluation.png")
+    plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+    print(f"✓ Plots saved to {plot_file}")
+    plt.show()
+
+    print("\n" + "="*80)
+    print("EVALUATION COMPLETE")
+    print("="*80)
+    print(f"\nAll outputs saved to: {OUTPUT_DIR}/")
+    print(f"  - generation_log.jsonl (detailed generation logs)")
+    print(f"  - results.csv (summary metrics)")
+    print(f"  - icw_evaluation.png (visualization)")
+    print("\n" + "="*80)
+    print("INTERPRETATION GUIDE")
+    print("="*80)
+    print("""
 Your results show watermarking effectiveness for your model:
 
 ROC-AUC Interpretation:
@@ -1001,3 +1040,7 @@ To improve results:
   • Increase samples: NUM_SAMPLES=200 for more stable metrics
   • Check generation_log.jsonl to see actual model outputs
 """)
+
+
+if __name__ == "__main__":
+    run_pipeline()

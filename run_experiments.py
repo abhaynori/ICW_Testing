@@ -18,22 +18,6 @@ MODELS_TO_TEST = [
 
 TEMPERATURES = [0.3, 0.7, 1.0]
 
-def update_config(model_name, temperature):
-    """Update main.py with specified model and temperature."""
-    with open("main.py", "r") as f:
-        content = f.read()
-    
-    # Replace MODEL_NAME
-    lines = content.split("\n")
-    for i, line in enumerate(lines):
-        if line.startswith("MODEL_NAME = "):
-            lines[i] = f'MODEL_NAME = "{model_name}"'
-        elif line.startswith("TEMPERATURE = "):
-            lines[i] = f"TEMPERATURE = {temperature}"
-    
-    with open("main.py", "w") as f:
-        f.write("\n".join(lines))
-
 def run_experiment(model_name, temperature):
     """Run experiment with given configuration."""
     print(f"\n{'='*80}")

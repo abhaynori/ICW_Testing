@@ -107,7 +107,7 @@ def run_comparison(base_model, trained_model_path, method, num_samples=50, disab
     comparison_data = []
 
     for method_name in base_results["Method"].unique():
-        if method_name.lower().startswith(method) is False:
+        if not method_name.lower().startswith(method):
             continue
         base_row = base_results[base_results["Method"] == method_name].iloc[0]
         trained_row = trained_results[trained_results["Method"] == method_name].iloc[0]
