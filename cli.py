@@ -66,7 +66,12 @@ def run_experiment(
     model_path=None,
     disable_wm_instruction=False,
     data_split="train",
-    generation_batch_size=4
+    generation_batch_size=4,
+    dataset_name="eli5",
+    prompt_variant="paper",
+    rules_variant="paper",
+    base_system_prompt=None,
+    system_prompt_prefix=None
 ):
     """Run the ICW experiment with specified configuration."""
 
@@ -91,6 +96,24 @@ def run_experiment(
         print(f"Valid options: {', '.join(sorted(valid_splits))}")
         sys.exit(1)
 
+    valid_datasets = {"eli5", "alpaca"}
+    if dataset_name not in valid_datasets:
+        print(f"Error: Invalid dataset '{dataset_name}'")
+        print(f"Valid options: {', '.join(sorted(valid_datasets))}")
+        sys.exit(1)
+
+    valid_prompt_variants = {"paper", "concise", "strict"}
+    if prompt_variant not in valid_prompt_variants:
+        print(f"Error: Invalid prompt variant '{prompt_variant}'")
+        print(f"Valid options: {', '.join(sorted(valid_prompt_variants))}")
+        sys.exit(1)
+
+    valid_rules_variants = {"paper", "minimal", "none"}
+    if rules_variant not in valid_rules_variants:
+        print(f"Error: Invalid rules variant '{rules_variant}'")
+        print(f"Valid options: {', '.join(sorted(valid_rules_variants))}")
+        sys.exit(1)
+
     if generation_batch_size < 1:
         print(f"Error: Generation batch size must be >= 1 (got {generation_batch_size})")
         sys.exit(1)
@@ -99,10 +122,21 @@ def run_experiment(
     os.environ['ICW_MEMORY_STRATEGY'] = model_strategy
     os.environ['ICW_TEMPERATURE'] = str(temperature)
     os.environ['ICW_NUM_SAMPLES'] = str(num_samples)
+    os.environ['ICW_DATASET_NAME'] = dataset_name
     os.environ['ICW_DATASET_SPLIT'] = data_split
     os.environ['ICW_GENERATION_BATCH_SIZE'] = str(generation_batch_size)
     os.environ['ICW_OUTPUT_DIR'] = output_dir
     os.environ['ICW_DISABLE_WM_INSTRUCTION'] = '1' if disable_wm_instruction else '0'
+    os.environ['ICW_PROMPT_VARIANT'] = prompt_variant
+    os.environ['ICW_RULES_VARIANT'] = rules_variant
+    if base_system_prompt:
+        os.environ['ICW_BASE_SYSTEM_PROMPT'] = base_system_prompt
+    else:
+        os.environ.pop('ICW_BASE_SYSTEM_PROMPT', None)
+    if system_prompt_prefix:
+        os.environ['ICW_SYSTEM_PROMPT_PREFIX'] = system_prompt_prefix
+    else:
+        os.environ.pop('ICW_SYSTEM_PROMPT_PREFIX', None)
 
     # If using a custom trained model path
     if model_path:
@@ -124,8 +158,15 @@ def run_experiment(
     print(f"Description:      {config.get('description', 'N/A')}")
     print(f"Temperature:      {temperature}")
     print(f"Num Samples:      {num_samples}")
+    print(f"Dataset:          {dataset_name}")
     print(f"Dataset Split:    {data_split}")
+    print(f"Prompt Variant:   {prompt_variant}")
+    print(f"Rules Variant:    {rules_variant}")
     print(f"Gen Batch Size:   {generation_batch_size}")
+    if base_system_prompt:
+        print(f"Base Sys Prompt:  {base_system_prompt}")
+    if system_prompt_prefix:
+        print(f"Prompt Prefix:    {system_prompt_prefix}")
     print(f"Output Dir:       {output_dir}")
     print("="*80 + "\n")
 
@@ -214,7 +255,45 @@ Examples:
         type=str,
         default='train',
         choices=['train', 'validation', 'test'],
-        help='ELI5 dataset split to evaluate on (default: train)'
+        help='Dataset split to evaluate on (default: train)'
+    )
+
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        default='eli5',
+        choices=['eli5', 'alpaca'],
+        help='Dataset to evaluate on (default: eli5)'
+    )
+
+    parser.add_argument(
+        '--prompt-variant',
+        type=str,
+        default='paper',
+        choices=['paper', 'concise', 'strict'],
+        help='Instruction prompt style variant (default: paper)'
+    )
+
+    parser.add_argument(
+        '--rules-variant',
+        type=str,
+        default='paper',
+        choices=['paper', 'minimal', 'none'],
+        help='Rules style variant for system prompts (default: paper)'
+    )
+
+    parser.add_argument(
+        '--base-system-prompt',
+        type=str,
+        default=None,
+        help='Override system prompt for non-watermarked generations'
+    )
+
+    parser.add_argument(
+        '--system-prompt-prefix',
+        type=str,
+        default=None,
+        help='Prefix applied to all watermark instruction system prompts'
     )
 
     parser.add_argument(
@@ -238,7 +317,12 @@ Examples:
         model_path=args.model_path,
         disable_wm_instruction=args.no_wm_instruction,
         data_split=args.split,
-        generation_batch_size=args.gen_batch_size
+        generation_batch_size=args.gen_batch_size,
+        dataset_name=args.dataset,
+        prompt_variant=args.prompt_variant,
+        rules_variant=args.rules_variant,
+        base_system_prompt=args.base_system_prompt,
+        system_prompt_prefix=args.system_prompt_prefix
     )
 
 if __name__ == "__main__":

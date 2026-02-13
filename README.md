@@ -87,6 +87,21 @@ python compare_models.py --base small --trained "grpo_models/acrostics_small_*/f
 
 **See [GRPO_QUICKSTART.md](GRPO_QUICKSTART.md) for quick start or [GRPO_TRAINING.md](GRPO_TRAINING.md) for full documentation.**
 
+### Mentor Feedback Sweep Runner
+
+To run structured sweeps over learning rate, LoRA, samples, rules/system-prompt variants, and generalization checks:
+
+```bash
+# Preview planned runs
+python mentor_experiment_runner.py --phase screen --dry-run
+
+# Execute a limited screening batch
+python mentor_experiment_runner.py --phase screen --execute --max-runs 8
+```
+
+This runner also includes optional utility benchmark hooks (IFEval, GSM8K, MMLU, SimpleQA) via `lm_eval`.
+See [MENTOR_EXPERIMENT_PLAN.md](MENTOR_EXPERIMENT_PLAN.md) for details.
+
 ## Configuration
 
 ### CLI Method (Recommended)

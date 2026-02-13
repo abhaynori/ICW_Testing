@@ -1,0 +1,5 @@
+Method,ROC-AUC (Base),ROC-AUC (GRPO),TPR@1%FPR (Base),TPR@1%FPR (GRPO),TPR@10%FPR (Base),TPR@10%FPR (GRPO),Difficulty,Watermark Type
+Unicode ICW,0.998,0.999,0.98,0.985,0.996,0.998,Easy,Syntactic
+Initials ICW,0.572,0.685,0.006,0.125,0.145,0.312,Very Hard,Lexical
+Lexical ICW,0.91,0.952,0.32,0.485,0.52,0.658,Medium,Lexical
+Acrostics ICW,0.59,0.723,0.036,0.158,0.234,0.389,Hard,Structural

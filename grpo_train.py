@@ -15,6 +15,7 @@ import torch
 import argparse
 import os
 import json
+import warnings
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, Dataset
@@ -26,6 +27,13 @@ except Exception:
     GRPOConfig = None
     GRPOTrainer = None
 
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+except Exception:
+    LoraConfig = None
+    get_peft_model = None
+    TaskType = None
+
 # Import existing detector functions and prompts from main.py
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -35,11 +43,10 @@ from main import (
     unicode_detector, unicode_embed_prompt,
     initials_detector, initials_embed_prompt, green_letters,
     lexical_detector, lexical_embed_prompt, green_words,
-    acrostics_detector, acrostics_embed_prompt, secret_sequence
+    acrostics_detector, acrostics_embed_prompt, secret_sequence,
+    get_base_system_prompt
 )
 from memory_config import get_model_config
-
-BASE_SYSTEM_PROMPT = "You are a helpful assistant. Provide clear, informative answers."
 
 
 def get_detector_and_args(method):
@@ -149,18 +156,47 @@ def get_prompt_function(method):
         raise ValueError(f"Unknown method: {method}")
 
 
-def prepare_dataset(num_samples=100, split="train"):
-    """Prepare training dataset from ELI5."""
-    print(f"Loading {num_samples} samples from ELI5 dataset...")
+def _slice_indices_for_split(size, split):
+    train_end = int(size * 0.8)
+    validation_end = int(size * 0.9)
+    if split == "train":
+        return 0, train_end
+    if split == "validation":
+        return train_end, validation_end
+    if split == "test":
+        return validation_end, size
+    raise ValueError(f"Unsupported split: {split}")
+
+
+def _format_alpaca_query(example):
+    instruction = (example.get("instruction") or "").strip()
+    input_text = (example.get("input") or "").strip()
+    if input_text:
+        return f"{instruction}\n\nContext: {input_text}"
+    return instruction
+
+
+def prepare_dataset(num_samples=100, split="train", dataset_name="eli5"):
+    """Prepare training/eval dataset from ELI5 or Alpaca."""
+    dataset_key = dataset_name.strip().lower()
+    print(f"Loading {num_samples} samples from {dataset_key} ({split})...")
     try:
-        eli5 = load_dataset("sentence-transformers/eli5", "pair", split=split)
+        if dataset_key == "eli5":
+            dataset = load_dataset("sentence-transformers/eli5", "pair", split=split)
+            queries = dataset["question"][:num_samples]
+        elif dataset_key == "alpaca":
+            dataset = load_dataset("yahma/alpaca-cleaned", split="train")
+            start, end = _slice_indices_for_split(len(dataset), split)
+            sampled = dataset.select(range(start, min(end, start + num_samples)))
+            queries = [_format_alpaca_query(row) for row in sampled]
+        else:
+            raise ValueError("dataset_name must be 'eli5' or 'alpaca'")
     except Exception as exc:
-        print(f"⚠️  Could not load split '{split}': {exc}")
+        print(f"⚠️  Could not load dataset '{dataset_key}' split '{split}': {exc}")
         return None
-    questions = eli5["question"][:num_samples]
 
     # Create dataset with queries
-    dataset_dict = {"query": questions}
+    dataset_dict = {"query": queries}
     dataset = Dataset.from_dict(dataset_dict)
 
     print(f"✓ Loaded {len(dataset)} samples")
@@ -173,7 +209,7 @@ def build_messages(query, prompt_fn=None, include_instruction=True):
         return prompt_fn(query)
 
     return [
-        {"role": "system", "content": BASE_SYSTEM_PROMPT},
+        {"role": "system", "content": get_base_system_prompt()},
         {"role": "user", "content": query}
     ]
 
@@ -302,6 +338,7 @@ def evaluate_model_on_split(
     max_samples,
     output_dir,
     split_name,
+    dataset_name="eli5",
     generation_batch_size=4,
     baseline_mean=None,
     baseline_std=None
@@ -356,6 +393,7 @@ def evaluate_model_on_split(
             normalized_mean = float(mean - baseline_mean)
 
     summary = {
+        "dataset": dataset_name,
         "split": split_name,
         "method": method,
         "include_instruction": include_instruction,
@@ -371,7 +409,7 @@ def evaluate_model_on_split(
         "samples": records
     }
 
-    eval_path = os.path.join(output_dir, f"eval_{split_name}.json")
+    eval_path = os.path.join(output_dir, f"eval_{dataset_name}_{split_name}.json")
     with open(eval_path, "w") as f:
         json.dump(output, f, indent=2)
 
@@ -393,8 +431,19 @@ def train_grpo(
     output_dir="grpo_models",
     eval_splits="validation,test",
     eval_samples=50,
+    train_dataset_name="eli5",
+    eval_dataset_names="eli5,alpaca",
     eval_no_instruction=True,
-    generation_batch_size=4
+    generation_batch_size=4,
+    prompt_variant="paper",
+    rules_variant="paper",
+    base_system_prompt=None,
+    system_prompt_prefix=None,
+    use_lora=False,
+    lora_rank=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj"
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -409,8 +458,35 @@ def train_grpo(
         output_dir: Directory to save trained models
         eval_splits: Comma-separated list of dataset splits to evaluate
         eval_samples: Number of samples for each evaluation split
+        train_dataset_name: Dataset for GRPO training
+        eval_dataset_names: Comma-separated list of datasets for post-training eval
         eval_no_instruction: Disable watermark instruction during eval
     """
+
+    valid_prompt_variants = {"paper", "concise", "strict"}
+    valid_rules_variants = {"paper", "minimal", "none"}
+    if prompt_variant not in valid_prompt_variants:
+        raise ValueError(
+            f"Invalid prompt_variant '{prompt_variant}'. "
+            f"Choose from: {', '.join(sorted(valid_prompt_variants))}"
+        )
+    if rules_variant not in valid_rules_variants:
+        raise ValueError(
+            f"Invalid rules_variant '{rules_variant}'. "
+            f"Choose from: {', '.join(sorted(valid_rules_variants))}"
+        )
+
+    # Configure prompt/rule variants consumed by main.py prompt builders.
+    os.environ["ICW_PROMPT_VARIANT"] = prompt_variant
+    os.environ["ICW_RULES_VARIANT"] = rules_variant
+    if base_system_prompt:
+        os.environ["ICW_BASE_SYSTEM_PROMPT"] = base_system_prompt
+    else:
+        os.environ.pop("ICW_BASE_SYSTEM_PROMPT", None)
+    if system_prompt_prefix:
+        os.environ["ICW_SYSTEM_PROMPT_PREFIX"] = system_prompt_prefix
+    else:
+        os.environ.pop("ICW_SYSTEM_PROMPT_PREFIX", None)
 
     print("\n" + "="*80)
     print("GRPO TRAINING FOR ICW WATERMARKING")
@@ -418,11 +494,20 @@ def train_grpo(
     print(f"Model Strategy: {model_strategy}")
     print(f"Method: {method}")
     print(f"Training Samples: {num_train_samples}")
+    print(f"Training Dataset: {train_dataset_name}")
     print(f"Epochs: {num_epochs}")
     print(f"Batch Size: {batch_size}")
     print(f"Generation Batch Size: {generation_batch_size}")
     print(f"Learning Rate: {learning_rate}")
+    print(f"Prompt Variant: {prompt_variant}")
+    print(f"Rules Variant: {rules_variant}")
+    print(f"Use LoRA: {use_lora}")
+    if use_lora:
+        print(f"LoRA Rank/Alpha/Dropout: {lora_rank}/{lora_alpha}/{lora_dropout}")
+        print(f"LoRA Target Modules: {lora_target_modules}")
     print(f"Eval Without Instructions: {eval_no_instruction}")
+    print(f"Eval Splits: {eval_splits}")
+    print(f"Eval Datasets: {eval_dataset_names}")
     print("="*80 + "\n")
 
     if GRPOConfig is None or GRPOTrainer is None:
@@ -460,10 +545,36 @@ def train_grpo(
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
 
+    if use_lora:
+        if LoraConfig is None or get_peft_model is None or TaskType is None:
+            raise ImportError(
+                "PEFT is required for LoRA training. Install dependencies with: pip install peft"
+            )
+        target_modules = [item.strip() for item in lora_target_modules.split(",") if item.strip()]
+        if not target_modules:
+            raise ValueError("LoRA target modules cannot be empty.")
+
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            target_modules=target_modules,
+            bias="none"
+        )
+        model = get_peft_model(model, lora_config)
+        if hasattr(model, "print_trainable_parameters"):
+            model.print_trainable_parameters()
+        print("✓ LoRA adapters attached")
+
     print("✓ Model loaded successfully!\n")
 
     # Prepare dataset
-    dataset = prepare_dataset(num_train_samples)
+    dataset = prepare_dataset(
+        num_samples=num_train_samples,
+        split="train",
+        dataset_name=train_dataset_name
+    )
     if dataset is None:
         raise ValueError("Training dataset could not be loaded.")
 
@@ -586,6 +697,17 @@ def train_grpo(
         "num_epochs": num_epochs,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
+        "train_dataset_name": train_dataset_name,
+        "eval_dataset_names": eval_dataset_names,
+        "prompt_variant": prompt_variant,
+        "rules_variant": rules_variant,
+        "base_system_prompt": get_base_system_prompt(),
+        "system_prompt_prefix": system_prompt_prefix or "",
+        "use_lora": use_lora,
+        "lora_rank": lora_rank if use_lora else None,
+        "lora_alpha": lora_alpha if use_lora else None,
+        "lora_dropout": lora_dropout if use_lora else None,
+        "lora_target_modules": lora_target_modules if use_lora else "",
         "baseline_mean": baseline_mean,
         "baseline_std": baseline_std,
         "timestamp": datetime.now().isoformat()
@@ -601,31 +723,47 @@ def train_grpo(
     # Optional evaluation on validation/test splits without watermark instructions
     if eval_splits:
         split_list = [s.strip() for s in eval_splits.split(",") if s.strip()]
+        dataset_list = [d.strip().lower() for d in eval_dataset_names.split(",") if d.strip()]
+        valid_datasets = {"eli5", "alpaca"}
+        for dataset_name in dataset_list:
+            if dataset_name not in valid_datasets:
+                warnings.warn(
+                    f"Unknown eval dataset '{dataset_name}', skipping. "
+                    f"Supported: {', '.join(sorted(valid_datasets))}"
+                )
         if split_list:
             print("\n" + "="*80)
             print("POST-TRAINING EVALUATION")
             print("="*80)
 
-            for split_name in split_list:
-                eval_dataset = prepare_dataset(eval_samples, split=split_name)
-                if eval_dataset is None:
-                    print(f"⚠️  Skipping evaluation for split '{split_name}'")
+            for dataset_name in dataset_list:
+                if dataset_name not in valid_datasets:
                     continue
+                for split_name in split_list:
+                    eval_dataset = prepare_dataset(
+                        num_samples=eval_samples,
+                        split=split_name,
+                        dataset_name=dataset_name
+                    )
+                    if eval_dataset is None:
+                        print(f"⚠️  Skipping evaluation for {dataset_name}:{split_name}")
+                        continue
 
-                evaluate_model_on_split(
-                    model=model,
-                    tokenizer=tokenizer,
-                    dataset=eval_dataset,
-                    method=method,
-                    prompt_fn=prompt_fn,
-                    include_instruction=not eval_no_instruction,
-                    max_samples=eval_samples,
-                    output_dir=training_args.output_dir,
-                    split_name=split_name,
-                    generation_batch_size=generation_batch_size,
-                    baseline_mean=baseline_mean,
-                    baseline_std=baseline_std
-                )
+                    evaluate_model_on_split(
+                        model=model,
+                        tokenizer=tokenizer,
+                        dataset=eval_dataset,
+                        method=method,
+                        prompt_fn=prompt_fn,
+                        include_instruction=not eval_no_instruction,
+                        max_samples=eval_samples,
+                        output_dir=training_args.output_dir,
+                        split_name=split_name,
+                        dataset_name=dataset_name,
+                        generation_batch_size=generation_batch_size,
+                        baseline_mean=baseline_mean,
+                        baseline_std=baseline_std
+                    )
 
     return final_model_path
 
@@ -694,6 +832,21 @@ Examples:
     )
 
     parser.add_argument(
+        '--train-dataset',
+        type=str,
+        default='eli5',
+        choices=['eli5', 'alpaca'],
+        help='Dataset used for GRPO training (default: eli5)'
+    )
+
+    parser.add_argument(
+        '--eval-datasets',
+        type=str,
+        default='eli5,alpaca',
+        help='Comma-separated datasets for post-training evaluation (default: eli5,alpaca)'
+    )
+
+    parser.add_argument(
         '--eval-no-instruction',
         dest='eval_no_instruction',
         action='store_true',
@@ -723,6 +876,70 @@ Examples:
     )
 
     parser.add_argument(
+        '--prompt-variant',
+        type=str,
+        default='paper',
+        choices=['paper', 'concise', 'strict'],
+        help='Instruction prompt style variant (default: paper)'
+    )
+
+    parser.add_argument(
+        '--rules-variant',
+        type=str,
+        default='paper',
+        choices=['paper', 'minimal', 'none'],
+        help='Rules variant for system prompts (default: paper)'
+    )
+
+    parser.add_argument(
+        '--base-system-prompt',
+        type=str,
+        default=None,
+        help='Override baseline non-watermarked system prompt'
+    )
+
+    parser.add_argument(
+        '--system-prompt-prefix',
+        type=str,
+        default=None,
+        help='Prefix injected at the top of watermarking system prompts'
+    )
+
+    parser.add_argument(
+        '--use-lora',
+        action='store_true',
+        help='Enable LoRA adapters during GRPO training'
+    )
+
+    parser.add_argument(
+        '--lora-rank',
+        type=int,
+        default=16,
+        help='LoRA rank r (default: 16)'
+    )
+
+    parser.add_argument(
+        '--lora-alpha',
+        type=int,
+        default=32,
+        help='LoRA alpha (default: 32)'
+    )
+
+    parser.add_argument(
+        '--lora-dropout',
+        type=float,
+        default=0.05,
+        help='LoRA dropout (default: 0.05)'
+    )
+
+    parser.add_argument(
+        '--lora-target-modules',
+        type=str,
+        default='q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj',
+        help='Comma-separated LoRA target modules'
+    )
+
+    parser.add_argument(
         '--output-dir',
         type=str,
         default='grpo_models',
@@ -740,6 +957,12 @@ Examples:
 
     if args.gen_batch_size < 1:
         parser.error("--gen-batch-size must be >= 1")
+    if args.lora_rank < 1:
+        parser.error("--lora-rank must be >= 1")
+    if args.lora_alpha < 1:
+        parser.error("--lora-alpha must be >= 1")
+    if args.lora_dropout < 0 or args.lora_dropout >= 1:
+        parser.error("--lora-dropout must be in [0, 1)")
 
     # Train
     model_path = train_grpo(
@@ -752,8 +975,19 @@ Examples:
         output_dir=args.output_dir,
         eval_splits=args.eval_splits,
         eval_samples=args.eval_samples,
+        train_dataset_name=args.train_dataset,
+        eval_dataset_names=args.eval_datasets,
         eval_no_instruction=args.eval_no_instruction,
-        generation_batch_size=args.gen_batch_size
+        generation_batch_size=args.gen_batch_size,
+        prompt_variant=args.prompt_variant,
+        rules_variant=args.rules_variant,
+        base_system_prompt=args.base_system_prompt,
+        system_prompt_prefix=args.system_prompt_prefix,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=args.lora_target_modules
     )
 
     print("\n" + "="*80)

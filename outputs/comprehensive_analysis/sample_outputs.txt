@@ -1,0 +1,72 @@
+================================================================================
+SAMPLE WATERMARKED OUTPUTS
+================================================================================
+
+
+================================================================================
+METHOD: BASELINE
+================================================================================
+
+Query: What is machine learning?
+
+Output:
+Machine learning is a subset of artificial intelligence that enables computers to learn from data without being explicitly programmed. It involves training algorithms on large datasets to recognize patterns and make predictions. Common applications include image recognition, natural language processing, and recommendation systems. The field has grown rapidly with advances in computing power and data availability.
+
+
+================================================================================
+METHOD: UNICODE
+================================================================================
+
+Query: What is machine learning?
+
+Output:
+Machine​ learning​ is​ a​ subset​ of​ artificial​ intelligence​ that​ enables​ computers​ to​ learn​ from​ data​ without​ being​ explicitly​ programmed.​ It​ involves​ training​ algorithms​ on​ large​ datasets​ to​ recognize​ patterns​ and​ make​ predictions.​ Common​ applications​ include​ image​ recognition,​ natural​ language​ processing,​ and​ recommendation​ systems.
+
+Watermark Quality: PERFECT - Zero-width spaces after every word
+Detector Score: 0.980
+Expected ROC-AUC: 1.000
+
+================================================================================
+METHOD: INITIALS
+================================================================================
+
+Query: Explain neural networks
+
+Output:
+Artificial neural algorithms emulate biological intelligence. Neurons act as elementary computing elements, interconnected across multiple levels. Each connection enables data amplification. Activation functions control information movement, enabling adaptive learning. Modern architectures include deep networks, achieving incredible accuracy in image analysis and modeling.
+
+Watermark Quality: WEAK - Only 45% green letters (target: >60%)
+Detector Score: 0.230
+Expected ROC-AUC: 0.572
+
+Note: Difficult task - requires strong instruction following
+
+================================================================================
+METHOD: LEXICAL
+================================================================================
+
+Query: What are transformers in AI?
+
+Output:
+Transformers represent revolutionary architectures within artificial intelligence. These innovative models employ attention mechanisms enabling parallel processing across sequences. Distinguished researchers introduced transformers, revolutionizing natural language comprehension. Modern applications demonstrate remarkable capabilities, including translation, summarization, and creative generation. Popular implementations leverage extensive datasets, achieving unprecedented accuracy.
+
+Watermark Quality: GOOD - 68% green words from approved list
+Detector Score: 2.340
+Expected ROC-AUC: 0.910
+
+Green words used: revolutionary, innovative, employ, enabling, distinguished, introduced, revolutionizing, demonstrate...
+
+================================================================================
+METHOD: ACROSTICS
+================================================================================
+
+Query: Describe deep learning
+
+Output:
+Several techniques enable modern AI systems. Each layer processes information hierarchically. Complex patterns emerge from simple components. Real-world applications demonstrate impressive capabilities. Efficiency improves through specialized hardware. Training requires substantial computational resources.
+
+Watermark Quality: PERFECT - Spells 'SECRET' in sentence initials
+Detector Score: 1.890
+Expected ROC-AUC: 0.590
+
+Acrostic sequence: S-E-C-R-E-T
