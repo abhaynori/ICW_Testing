@@ -223,6 +223,68 @@ def build_grpo_config(base_training_args, generation_args, num_generations=4):
     return GRPOConfig(**config_kwargs)
 
 
+def build_grpo_trainer(model, training_args, train_dataset, tokenizer, reward_fn):
+    """
+    Build GRPOTrainer in a way that is compatible across TRL versions.
+    """
+    signature = inspect.signature(GRPOTrainer.__init__)
+    accepted = {name for name in signature.parameters if name != "self"}
+
+    trainer_kwargs = {}
+
+    if "model" in accepted:
+        trainer_kwargs["model"] = model
+    elif "policy" in accepted:
+        trainer_kwargs["policy"] = model
+    else:
+        raise TypeError("Unsupported GRPOTrainer signature: missing model/policy argument.")
+
+    if "args" in accepted:
+        trainer_kwargs["args"] = training_args
+    elif "config" in accepted:
+        trainer_kwargs["config"] = training_args
+
+    if "train_dataset" in accepted:
+        trainer_kwargs["train_dataset"] = train_dataset
+    elif "dataset" in accepted:
+        trainer_kwargs["dataset"] = train_dataset
+
+    if "tokenizer" in accepted:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in accepted:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "processor" in accepted:
+        trainer_kwargs["processor"] = tokenizer
+
+    reward_attempts = []
+    if "reward_function" in accepted:
+        reward_attempts.append(("reward_function", reward_fn))
+    if "reward_funcs" in accepted:
+        reward_attempts.append(("reward_funcs", reward_fn))
+        reward_attempts.append(("reward_funcs", [reward_fn]))
+    if "reward_fn" in accepted:
+        reward_attempts.append(("reward_fn", reward_fn))
+
+    if not reward_attempts:
+        raise TypeError(
+            "Unsupported GRPOTrainer signature: no reward_function/reward_funcs/reward_fn argument."
+        )
+
+    last_error = None
+    for reward_key, reward_value in reward_attempts:
+        try:
+            return GRPOTrainer(
+                **trainer_kwargs,
+                **{reward_key: reward_value},
+            )
+        except TypeError as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Failed to initialize GRPOTrainer for unknown reasons.")
+
+
 def prepare_dataset(num_samples=100, split="train", dataset_name="eli5"):
     """Prepare training/eval dataset from ELI5 or Alpaca."""
     dataset_key = dataset_name.strip().lower()
@@ -689,33 +751,13 @@ def train_grpo(
 
     # Initialize GRPO Trainer
     print("\nInitializing GRPO Trainer...")
-
-    trainer_kwargs = {
-        "model": model,
-        "args": training_args,
-        "train_dataset": tokenized_dataset,
-        "tokenizer": tokenizer,
-    }
-
-    try:
-        trainer = GRPOTrainer(
-            **trainer_kwargs,
-            reward_function=reward_fn,
-        )
-    except TypeError as exc:
-        # Compatibility fallback for TRL versions using reward_funcs instead.
-        if "reward_function" not in str(exc):
-            raise
-        try:
-            trainer = GRPOTrainer(
-                **trainer_kwargs,
-                reward_funcs=reward_fn,
-            )
-        except TypeError:
-            trainer = GRPOTrainer(
-                **trainer_kwargs,
-                reward_funcs=[reward_fn],
-            )
+    trainer = build_grpo_trainer(
+        model=model,
+        training_args=training_args,
+        train_dataset=tokenized_dataset,
+        tokenizer=tokenizer,
+        reward_fn=reward_fn,
+    )
 
     print("✓ Trainer initialized\n")
 
