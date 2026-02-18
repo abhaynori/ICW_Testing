@@ -12,8 +12,10 @@ from datetime import datetime
 import os
 import re
 import pandas as pd
-import matplotlib.pyplot as plt
 import warnings
+import zipfile
+
+plt = None
 
 def _ensure_nltk_data():
     """Download NLTK data only if not already present."""
@@ -24,7 +26,7 @@ def _ensure_nltk_data():
     ]:
         try:
             nltk.data.find(resource)
-        except LookupError:
+        except (LookupError, OSError, zipfile.BadZipFile):
             try:
                 nltk.download(name, quiet=True)
                 nltk.data.find(resource)
@@ -38,6 +40,22 @@ def _ensure_nltk_data():
     return len(missing) == 0
 
 NLTK_READY = _ensure_nltk_data()
+
+
+def _ensure_matplotlib():
+    """Lazy import matplotlib only when plotting is needed."""
+    global plt
+    if plt is not None:
+        return True
+    try:
+        import matplotlib.pyplot as _plt
+        plt = _plt
+        return True
+    except Exception as exc:
+        warnings.warn(
+            f"Matplotlib unavailable ({exc}). Plot image export will be skipped."
+        )
+        return False
 
 
 def _fallback_sent_tokenize(text):
