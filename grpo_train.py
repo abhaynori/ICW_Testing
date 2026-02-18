@@ -77,6 +77,8 @@ class WatermarkRewardFunction:
         self.method = method
         self.baseline_mean = baseline_mean
         self.baseline_std = baseline_std
+        # Some TRL versions require reward callables to expose __name__.
+        self.__name__ = f"watermark_reward_{method}"
 
         # Set up detector and arguments
         self.detector, self.detector_args = get_detector_and_args(method)
