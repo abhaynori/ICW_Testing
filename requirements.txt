@@ -15,3 +15,6 @@ bitsandbytes>=0.41.0
 # For GRPO training (optional - only needed if training models)
 trl>=0.7.0
 peft>=0.6.0
+
+# For mentor utility benchmarks (IFEval/GSM8K/MMLU/SimpleQA via lm_eval)
+lm-eval>=0.4.0

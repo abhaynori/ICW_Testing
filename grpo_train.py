@@ -15,6 +15,7 @@ import torch
 import argparse
 import os
 import json
+import inspect
 import warnings
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -174,6 +175,52 @@ def _format_alpaca_query(example):
     if input_text:
         return f"{instruction}\n\nContext: {input_text}"
     return instruction
+
+
+def build_grpo_config(base_training_args, generation_args, num_generations=4):
+    """
+    Build GRPOConfig in a way that is compatible across TRL versions.
+    """
+    signature = inspect.signature(GRPOConfig.__init__)
+    accepted = {name for name in signature.parameters if name != "self"}
+
+    config_kwargs = {}
+    for key, value in base_training_args.items():
+        if key in accepted:
+            config_kwargs[key] = value
+
+    # Generation controls vary heavily across TRL versions.
+    if "generation_kwargs" in accepted:
+        config_kwargs["generation_kwargs"] = dict(generation_args)
+    else:
+        for key, value in generation_args.items():
+            if key in accepted:
+                config_kwargs[key] = value
+        if (
+            "max_completion_length" in accepted
+            and "max_new_tokens" in generation_args
+            and "max_completion_length" not in config_kwargs
+        ):
+            config_kwargs["max_completion_length"] = generation_args["max_new_tokens"]
+
+    # Number of completions field name changed across versions.
+    if "num_generations" in accepted:
+        config_kwargs["num_generations"] = num_generations
+    elif "num_generation_per_prompt" in accepted:
+        config_kwargs["num_generation_per_prompt"] = num_generations
+    elif "num_return_sequences" in accepted:
+        config_kwargs["num_return_sequences"] = num_generations
+
+    dropped = sorted(
+        set(base_training_args).union(generation_args) - set(config_kwargs)
+    )
+    if dropped:
+        warnings.warn(
+            "Ignoring unsupported GRPOConfig args for this TRL version: "
+            + ", ".join(dropped)
+        )
+
+    return GRPOConfig(**config_kwargs)
 
 
 def prepare_dataset(num_samples=100, split="train", dataset_name="eli5"):
@@ -522,6 +569,9 @@ def train_grpo(
     model_name = config["model_name"]
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    # Decoder-only models should be left-padded when batching generations.
+    if getattr(tokenizer, "padding_side", "right") != "left":
+        tokenizer.padding_side = "left"
 
     model_kwargs = {
         "device_map": config.get("device_map", "auto"),
@@ -625,20 +675,17 @@ def train_grpo(
         "warmup_steps": 10,
         "max_grad_norm": 1.0,
         "seed": 42,
+    }
+    generation_args = {
         "max_new_tokens": 200,
         "temperature": 0.7,
         "top_p": 0.9,
     }
-    try:
-        training_args = GRPOConfig(
-            **base_training_args,
-            num_generation_per_prompt=4,  # Older naming in some TRL releases
-        )
-    except TypeError:
-        training_args = GRPOConfig(
-            **base_training_args,
-            num_generations=4,  # Newer naming in some TRL releases
-        )
+    training_args = build_grpo_config(
+        base_training_args=base_training_args,
+        generation_args=generation_args,
+        num_generations=4,
+    )
 
     # Initialize GRPO Trainer
     print("\nInitializing GRPO Trainer...")

@@ -21,11 +21,13 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import importlib.util
 import itertools
 import json
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -112,14 +114,20 @@ def _parse_str_list(value: str | None) -> list[str] | None:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _resolve_lora_values(args: argparse.Namespace, phase: dict) -> list[bool]:
+    if args.lora_mode == "both":
+        return phase["use_lora"]
+    if args.lora_mode == "on":
+        return [True]
+    return [False]
+
+
 def build_specs(args: argparse.Namespace) -> list[ExperimentSpec]:
     phase = PHASE_CONFIG[args.phase]
     methods = _parse_str_list(args.methods) or phase["methods"]
     learning_rates = _parse_float_list(args.learning_rates) or phase["learning_rates"]
     samples = _parse_int_list(args.samples) or phase["samples"]
-    use_lora_values = [False, True] if args.use_lora_both else [args.use_lora]
-    if args.use_lora_both:
-        use_lora_values = phase["use_lora"]
+    use_lora_values = _resolve_lora_values(args, phase)
     rules_variants = _parse_str_list(args.rules_variants) or phase["rules_variants"]
     prompt_variants = _parse_str_list(args.prompt_variants) or phase["prompt_variants"]
     system_profiles = _parse_str_list(args.system_profiles) or phase["system_profiles"]
@@ -334,10 +342,20 @@ def build_eval_commands(
     return commands
 
 
+def _resolve_lm_eval_launcher() -> list[str] | None:
+    binary = shutil.which("lm_eval")
+    if binary:
+        return [binary]
+    if importlib.util.find_spec("lm_eval") is not None:
+        return [sys.executable, "-m", "lm_eval"]
+    return None
+
+
 def build_utility_commands(
     trained_model_path: str,
     tasks: list[str],
     run_dir: Path,
+    lm_eval_launcher: list[str],
 ) -> dict[str, list[str]]:
     commands: dict[str, list[str]] = {}
     for task in tasks:
@@ -345,7 +363,7 @@ def build_utility_commands(
         if not task_clean:
             continue
         commands[f"utility_{task_clean}"] = [
-            "lm_eval",
+            *lm_eval_launcher,
             "--model",
             "hf",
             "--model_args",
@@ -401,11 +419,26 @@ def main() -> None:
         help=f"Comma-separated profiles: {','.join(SYSTEM_PROMPT_PROFILES.keys())}",
     )
 
-    parser.add_argument("--use-lora", action="store_true", help="Use LoRA only")
+    parser.add_argument(
+        "--lora-mode",
+        choices=["both", "on", "off"],
+        default="both",
+        help="LoRA sweep mode: both (default), on only, or off only",
+    )
+    parser.add_argument(
+        "--use-lora",
+        action="store_true",
+        help="Legacy alias for --lora-mode on",
+    )
     parser.add_argument(
         "--use-lora-both",
         action="store_true",
-        help="Use both LoRA=False and LoRA=True settings",
+        help="Legacy alias for --lora-mode both",
+    )
+    parser.add_argument(
+        "--no-lora",
+        action="store_true",
+        help="Legacy alias for --lora-mode off",
     )
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -437,8 +470,25 @@ def main() -> None:
         help="Comma-separated utility tasks for lm_eval",
     )
     parser.add_argument("--skip-utility", action="store_true")
+    parser.add_argument(
+        "--allow-missing-utility",
+        action="store_true",
+        help="Continue run plan even if lm_eval is unavailable",
+    )
     parser.add_argument("--output-root", default="mentor_runs")
     args = parser.parse_args()
+
+    lora_aliases = [args.use_lora, args.use_lora_both, args.no_lora]
+    if sum(1 for value in lora_aliases if value) > 1:
+        parser.error(
+            "Conflicting LoRA options. Choose at most one of --use-lora, --use-lora-both, --no-lora."
+        )
+    if args.use_lora:
+        args.lora_mode = "on"
+    elif args.use_lora_both:
+        args.lora_mode = "both"
+    elif args.no_lora:
+        args.lora_mode = "off"
 
     if args.dry_run:
         args.execute = False
@@ -464,8 +514,15 @@ def main() -> None:
         "runs": [],
     }
 
-    utility_available = shutil.which("lm_eval") is not None
+    lm_eval_launcher = _resolve_lm_eval_launcher()
+    utility_available = lm_eval_launcher is not None
     utility_tasks = [task.strip() for task in args.utility_tasks.split(",") if task.strip()]
+    if not args.skip_utility and not utility_available and not args.allow_missing_utility:
+        raise SystemExit(
+            "Utility evaluation requested but lm_eval is not available. "
+            "Install with `pip install lm-eval`, or rerun with --skip-utility "
+            "(or --allow-missing-utility to keep planning without utility)."
+        )
 
     for index, spec in enumerate(specs, start=1):
         run_dir = run_root / f"{index:03d}_{spec.run_id}"
@@ -499,7 +556,12 @@ def main() -> None:
                 run_record["utility"]["status"] = "lm_eval_not_found"
                 print("  utility: lm_eval not found, skipping utility evaluation")
             else:
-                utility_cmds = build_utility_commands(placeholder_model, utility_tasks, run_dir)
+                utility_cmds = build_utility_commands(
+                    placeholder_model,
+                    utility_tasks,
+                    run_dir,
+                    lm_eval_launcher,
+                )
                 for util_name, util_cmd in utility_cmds.items():
                     print(f"  {util_name}: {_command_to_str(util_cmd)}")
                     run_record["utility"][util_name] = {
@@ -577,7 +639,12 @@ def main() -> None:
             run_record["utility"]["status"] = "lm_eval_not_found"
             print("  utility: lm_eval not found, skipping utility evaluation")
         else:
-            utility_cmds = build_utility_commands(trained_model_path, utility_tasks, run_dir)
+            utility_cmds = build_utility_commands(
+                trained_model_path,
+                utility_tasks,
+                run_dir,
+                lm_eval_launcher,
+            )
             for util_name, util_cmd in utility_cmds.items():
                 print(f"  {util_name}: {_command_to_str(util_cmd)}")
                 run_record["utility"][util_name] = {"command": util_cmd, "status": "planned"}

@@ -99,7 +99,8 @@ python mentor_experiment_runner.py --phase screen --dry-run
 python mentor_experiment_runner.py --phase screen --execute --max-runs 8
 ```
 
-This runner also includes optional utility benchmark hooks (IFEval, GSM8K, MMLU, SimpleQA) via `lm_eval`.
+LoRA is swept on/off by default in this runner (`--lora-mode both`).
+Utility benchmark hooks (IFEval, GSM8K, MMLU, SimpleQA) use `lm_eval` and are required by default unless you pass `--skip-utility` (or `--allow-missing-utility` in constrained setups).
 See [MENTOR_EXPERIMENT_PLAN.md](MENTOR_EXPERIMENT_PLAN.md) for details.
 
 ## Configuration
