@@ -17,6 +17,7 @@ import os
 import json
 import inspect
 import warnings
+import re
 from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, Dataset
@@ -67,7 +68,19 @@ def get_detector_and_args(method):
 class WatermarkRewardFunction:
     """Reward function that uses existing detectors."""
 
-    def __init__(self, method, baseline_mean=0.0, baseline_std=1.0):
+    def __init__(
+        self,
+        method,
+        baseline_mean=0.0,
+        baseline_std=1.0,
+        detector_weight=1.0,
+        reward_shaping=False,
+        shaping_format_weight=0.10,
+        shaping_partial_weight=0.25,
+        shaping_length_weight=0.05,
+        shaping_target_words=120,
+        max_abs_reward=10.0
+    ):
         """
         Args:
             method: One of 'unicode', 'initials', 'lexical', 'acrostics'
@@ -77,6 +90,13 @@ class WatermarkRewardFunction:
         self.method = method
         self.baseline_mean = baseline_mean
         self.baseline_std = baseline_std
+        self.detector_weight = detector_weight
+        self.reward_shaping = reward_shaping
+        self.shaping_format_weight = shaping_format_weight
+        self.shaping_partial_weight = shaping_partial_weight
+        self.shaping_length_weight = shaping_length_weight
+        self.shaping_target_words = max(1, int(shaping_target_words))
+        self.max_abs_reward = max_abs_reward
         # Some TRL versions require reward callables to expose __name__.
         self.__name__ = f"watermark_reward_{method}"
 
@@ -117,6 +137,73 @@ class WatermarkRewardFunction:
             return [self._to_text(first)]
         return []
 
+    @staticmethod
+    def _safe_words(text):
+        return re.findall(r"\b[a-zA-Z][a-zA-Z'-]*\b", text)
+
+    @staticmethod
+    def _split_sentences(text):
+        pieces = re.split(r"[.!?\n]+", text)
+        return [piece.strip() for piece in pieces if piece.strip()]
+
+    def _format_score(self, text):
+        words = self._safe_words(text)
+        word_count = len(words)
+        sentences = self._split_sentences(text)
+
+        has_content = 1.0 if word_count >= 8 else 0.0
+        has_structure = 1.0 if len(sentences) >= 2 else 0.0
+        has_reasonable_length = min(word_count / float(self.shaping_target_words), 1.0)
+
+        # In [0, 1], rewards outputs that are non-empty, structured, and long enough.
+        return 0.35 * has_content + 0.25 * has_structure + 0.40 * has_reasonable_length
+
+    def _partial_progress_score(self, text):
+        words = self._safe_words(text)
+        if not words:
+            return 0.0
+
+        if self.method == "unicode":
+            zero_width_count = text.count("\u200b")
+            return min(zero_width_count / max(1, len(words) * 0.20), 1.0)
+
+        if self.method == "initials":
+            green_hits = sum(1 for token in words if token[0].lower() in green_letters)
+            return green_hits / max(1, len(words))
+
+        if self.method == "lexical":
+            word_set = {token.lower() for token in words}
+            green_hits = sum(1 for token in green_words if token.lower() in word_set)
+            # Saturate once a reasonable number of green words appears.
+            return min(green_hits / 8.0, 1.0)
+
+        if self.method == "acrostics":
+            sentences = self._split_sentences(text)
+            if not sentences:
+                return 0.0
+            initials = []
+            for sentence in sentences:
+                sentence_words = self._safe_words(sentence)
+                if sentence_words:
+                    initials.append(sentence_words[0][0].upper())
+            if not initials:
+                return 0.0
+            target = "".join(secret_sequence)
+            observed = "".join(initials)
+            compare_len = min(len(target), len(observed))
+            if compare_len == 0:
+                return 0.0
+            prefix_matches = sum(
+                1 for idx in range(compare_len) if observed[idx] == target[idx]
+            )
+            return prefix_matches / float(compare_len)
+
+        return 0.0
+
+    def _length_score(self, text):
+        words = self._safe_words(text)
+        return min(len(words) / float(self.shaping_target_words), 1.0)
+
     def __call__(self, *args, **kwargs):
         """
         Compute rewards for a batch of generated texts.
@@ -140,7 +227,17 @@ class WatermarkRewardFunction:
             else:
                 normalized_score = score - self.baseline_mean
 
-            rewards.append(normalized_score)
+            reward_value = self.detector_weight * normalized_score
+
+            if self.reward_shaping:
+                reward_value += self.shaping_format_weight * self._format_score(text)
+                reward_value += self.shaping_partial_weight * self._partial_progress_score(text)
+                reward_value += self.shaping_length_weight * self._length_score(text)
+
+            if self.max_abs_reward is not None and self.max_abs_reward > 0:
+                reward_value = float(np.clip(reward_value, -self.max_abs_reward, self.max_abs_reward))
+
+            rewards.append(reward_value)
 
         return torch.tensor(rewards, dtype=torch.float32)
 
@@ -225,7 +322,14 @@ def build_grpo_config(base_training_args, generation_args, num_generations=4):
     return GRPOConfig(**config_kwargs)
 
 
-def build_grpo_trainer(model, training_args, train_dataset, tokenizer, reward_fn):
+def build_grpo_trainer(
+    model,
+    training_args,
+    train_dataset,
+    tokenizer,
+    reward_fn,
+    reference_model=None
+):
     """
     Build GRPOTrainer in a way that is compatible across TRL versions.
     """
@@ -257,6 +361,17 @@ def build_grpo_trainer(model, training_args, train_dataset, tokenizer, reward_fn
         trainer_kwargs["processing_class"] = tokenizer
     elif "processor" in accepted:
         trainer_kwargs["processor"] = tokenizer
+
+    if reference_model is not None:
+        if "ref_model" in accepted:
+            trainer_kwargs["ref_model"] = reference_model
+        elif "reference_model" in accepted:
+            trainer_kwargs["reference_model"] = reference_model
+        else:
+            warnings.warn(
+                "Reference model was requested, but this TRL version does not expose "
+                "a ref_model/reference_model argument. Falling back to default KL reference behavior."
+            )
 
     reward_attempts = []
     if "reward_function" in accepted:
@@ -554,7 +669,16 @@ def train_grpo(
     lora_rank=16,
     lora_alpha=32,
     lora_dropout=0.05,
-    lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj"
+    lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
+    warm_start_model_path=None,
+    reference_model_path=None,
+    disable_reference_model=False,
+    reward_shaping=False,
+    shaping_format_weight=0.10,
+    shaping_partial_weight=0.25,
+    shaping_length_weight=0.05,
+    shaping_target_words=120,
+    max_abs_reward=10.0
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -572,6 +696,10 @@ def train_grpo(
         train_dataset_name: Dataset for GRPO training
         eval_dataset_names: Comma-separated list of datasets for post-training eval
         eval_no_instruction: Disable watermark instruction during eval
+        warm_start_model_path: Optional SFT checkpoint path used to initialize policy
+        reference_model_path: Optional override for KL reference policy
+        disable_reference_model: Disable explicit KL reference model loading
+        reward_shaping: Add explicit shaping terms for partial progress/format/length
     """
 
     valid_prompt_variants = {"paper", "concise", "strict"}
@@ -616,6 +744,20 @@ def train_grpo(
     if use_lora:
         print(f"LoRA Rank/Alpha/Dropout: {lora_rank}/{lora_alpha}/{lora_dropout}")
         print(f"LoRA Target Modules: {lora_target_modules}")
+    print(f"Warm Start Model: {warm_start_model_path or 'None'}")
+    if disable_reference_model:
+        kl_reference_text = "Disabled"
+    else:
+        kl_reference_text = reference_model_path or "Auto"
+    print(f"KL Reference Override: {kl_reference_text}")
+    print(f"Reward Shaping: {reward_shaping}")
+    if reward_shaping:
+        print(
+            "Reward Shaping Weights (format/partial/length): "
+            f"{shaping_format_weight}/{shaping_partial_weight}/{shaping_length_weight}"
+        )
+        print(f"Reward Shaping Target Words: {shaping_target_words}")
+    print(f"Reward Clip |r|<= {max_abs_reward}")
     print(f"Eval Without Instructions: {eval_no_instruction}")
     print(f"Eval Splits: {eval_splits}")
     print(f"Eval Datasets: {eval_dataset_names}")
@@ -631,8 +773,23 @@ def train_grpo(
     print("Loading base model...")
     config = get_model_config(model_strategy)
     model_name = config["model_name"]
+    policy_model_path = warm_start_model_path or model_name
+    if warm_start_model_path:
+        print(f"Warm-starting policy from: {warm_start_model_path}")
+        print(f"KL default reference will remain base instruct model: {model_name}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer_source = policy_model_path
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+    except Exception:
+        if tokenizer_source != model_name:
+            warnings.warn(
+                f"Could not load tokenizer from '{tokenizer_source}'. "
+                f"Falling back to base model tokenizer '{model_name}'."
+            )
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        else:
+            raise
     # Decoder-only models should be left-padded when batching generations.
     if getattr(tokenizer, "padding_side", "right") != "left":
         tokenizer.padding_side = "left"
@@ -653,7 +810,7 @@ def train_grpo(
     elif config.get("dtype"):
         model_kwargs["torch_dtype"] = config["dtype"]
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(policy_model_path, **model_kwargs)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -681,7 +838,22 @@ def train_grpo(
             model.print_trainable_parameters()
         print("✓ LoRA adapters attached")
 
-    print("✓ Model loaded successfully!\n")
+    print("✓ Policy model loaded successfully!\n")
+
+    # For warm starts, default KL reference to the original instruct model.
+    reference_source = None if disable_reference_model else reference_model_path
+    if reference_source is None and warm_start_model_path:
+        reference_source = model_name
+
+    reference_model = None
+    if reference_source:
+        print(f"Loading KL reference model from: {reference_source}")
+        reference_kwargs = dict(model_kwargs)
+        reference_model = AutoModelForCausalLM.from_pretrained(reference_source, **reference_kwargs)
+        reference_model.eval()
+        for parameter in reference_model.parameters():
+            parameter.requires_grad_(False)
+        print("✓ Reference model loaded for KL regularization\n")
 
     # Prepare dataset
     dataset = prepare_dataset(
@@ -703,7 +875,17 @@ def train_grpo(
     )
 
     # Create reward function
-    reward_fn = WatermarkRewardFunction(method, baseline_mean, baseline_std)
+    reward_fn = WatermarkRewardFunction(
+        method,
+        baseline_mean,
+        baseline_std,
+        reward_shaping=reward_shaping,
+        shaping_format_weight=shaping_format_weight,
+        shaping_partial_weight=shaping_partial_weight,
+        shaping_length_weight=shaping_length_weight,
+        shaping_target_words=shaping_target_words,
+        max_abs_reward=max_abs_reward
+    )
 
     # Get prompt function
     prompt_fn = get_prompt_function(method)
@@ -759,6 +941,7 @@ def train_grpo(
         train_dataset=tokenized_dataset,
         tokenizer=tokenizer,
         reward_fn=reward_fn,
+        reference_model=reference_model,
     )
 
     print("✓ Trainer initialized\n")
@@ -782,6 +965,10 @@ def train_grpo(
     # Save training metadata
     metadata = {
         "base_model": model_name,
+        "policy_model_init": policy_model_path,
+        "warm_start_model_path": warm_start_model_path,
+        "kl_reference_model_path": reference_source,
+        "disable_reference_model": disable_reference_model,
         "model_strategy": model_strategy,
         "method": method,
         "num_train_samples": num_train_samples,
@@ -799,6 +986,12 @@ def train_grpo(
         "lora_alpha": lora_alpha if use_lora else None,
         "lora_dropout": lora_dropout if use_lora else None,
         "lora_target_modules": lora_target_modules if use_lora else "",
+        "reward_shaping": reward_shaping,
+        "shaping_format_weight": shaping_format_weight if reward_shaping else None,
+        "shaping_partial_weight": shaping_partial_weight if reward_shaping else None,
+        "shaping_length_weight": shaping_length_weight if reward_shaping else None,
+        "shaping_target_words": shaping_target_words if reward_shaping else None,
+        "max_abs_reward": max_abs_reward,
         "baseline_mean": baseline_mean,
         "baseline_std": baseline_std,
         "timestamp": datetime.now().isoformat()
@@ -875,6 +1068,9 @@ Examples:
   for method in unicode initials lexical acrostics; do
     python grpo_train.py --model small --method $method --epochs 3
   done
+
+  # Warm-start GRPO from SFT checkpoint, keep KL reference on instruct model
+  python grpo_train.py --model small --method lexical --warm-start-model path/to/sft_model
         """
     )
 
@@ -1031,6 +1227,67 @@ Examples:
     )
 
     parser.add_argument(
+        '--warm-start-model',
+        type=str,
+        default=None,
+        help='Path/name of SFT checkpoint used to initialize GRPO policy model'
+    )
+
+    parser.add_argument(
+        '--reference-model',
+        type=str,
+        default=None,
+        help='Path/name for KL reference model (default: base instruct model when warm-starting)'
+    )
+
+    parser.add_argument(
+        '--no-reference-model',
+        action='store_true',
+        help='Disable explicit KL reference model loading'
+    )
+
+    parser.add_argument(
+        '--reward-shaping',
+        action='store_true',
+        help='Enable explicit reward shaping terms (format/partial/length)'
+    )
+
+    parser.add_argument(
+        '--shaping-format-weight',
+        type=float,
+        default=0.10,
+        help='Weight for format/structure shaping reward (default: 0.10)'
+    )
+
+    parser.add_argument(
+        '--shaping-partial-weight',
+        type=float,
+        default=0.25,
+        help='Weight for partial-progress shaping reward (default: 0.25)'
+    )
+
+    parser.add_argument(
+        '--shaping-length-weight',
+        type=float,
+        default=0.05,
+        help='Weight for length shaping reward (default: 0.05)'
+    )
+
+    parser.add_argument(
+        '--shaping-target-words',
+        type=int,
+        default=120,
+        help='Target word count for shaping terms (default: 120)'
+    )
+
+    parser.add_argument(
+        '--max-abs-reward',
+        type=float,
+        default=10.0,
+        help='Clip reward magnitude to this absolute value (default: 10.0)'
+    )
+
+    parser.add_argument(
         '--output-dir',
         type=str,
         default='grpo_models',
@@ -1054,6 +1311,12 @@ Examples:
         parser.error("--lora-alpha must be >= 1")
     if args.lora_dropout < 0 or args.lora_dropout >= 1:
         parser.error("--lora-dropout must be in [0, 1)")
+    if args.shaping_target_words < 1:
+        parser.error("--shaping-target-words must be >= 1")
+    if args.max_abs_reward <= 0:
+        parser.error("--max-abs-reward must be > 0")
+    if args.no_reference_model and args.reference_model is not None:
+        parser.error("--reference-model cannot be set together with --no-reference-model")
 
     # Train
     model_path = train_grpo(
@@ -1078,19 +1341,32 @@ Examples:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        lora_target_modules=args.lora_target_modules
+        lora_target_modules=args.lora_target_modules,
+        warm_start_model_path=args.warm_start_model,
+        reference_model_path=args.reference_model,
+        disable_reference_model=args.no_reference_model,
+        reward_shaping=args.reward_shaping,
+        shaping_format_weight=args.shaping_format_weight,
+        shaping_partial_weight=args.shaping_partial_weight,
+        shaping_length_weight=args.shaping_length_weight,
+        shaping_target_words=args.shaping_target_words,
+        max_abs_reward=args.max_abs_reward
     )
 
     print("\n" + "="*80)
     print("NEXT STEPS")
     print("="*80)
-    print(f"\n1. Test the trained model:")
+    print(f"\n1. (Optional) Create an SFT warm-start checkpoint:")
+    print(f"   python sft_train.py --model {args.model} --method {args.method} --samples 500 --epochs 1")
+    print(f"   # Then use it in GRPO:")
+    print(f"   python grpo_train.py --model {args.model} --method {args.method} --warm-start-model <path_to_sft_final_model>")
+    print(f"\n2. Test the trained model:")
     print(f"   python cli.py --model-path {model_path} --samples 50")
     print(f"   # Validation/test-style evaluation without watermark instructions")
     print(f"   python cli.py --model-path {model_path} --samples 50 --split test --no-wm-instruction")
-    print(f"\n2. Compare with base model:")
+    print(f"\n3. Compare with base model:")
     print(f"   python compare_models.py --base {args.model} --trained {model_path} --method {args.method} --split test --no-wm-instruction")
-    print(f"\n3. Train on other methods:")
+    print(f"\n4. Train on other methods:")
     print(f"   python grpo_train.py --model {args.model} --method <other_method> --epochs {args.epochs}")
     print()
 
