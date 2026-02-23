@@ -8,6 +8,7 @@ Usage examples:
 """
 
 import argparse
+import inspect
 import json
 import os
 import re
@@ -39,6 +40,65 @@ from main import (
     unicode_embed_prompt,
 )
 from memory_config import get_model_config
+
+
+def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=None):
+    """
+    Load CausalLM model while handling dtype argument differences across
+    transformers versions (`dtype` vs `torch_dtype`).
+    """
+    if dtype_value is None:
+        return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+    modern_kwargs = dict(model_kwargs)
+    modern_kwargs["dtype"] = dtype_value
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name, **modern_kwargs)
+    except TypeError:
+        legacy_kwargs = dict(model_kwargs)
+        legacy_kwargs["torch_dtype"] = dtype_value
+        return AutoModelForCausalLM.from_pretrained(model_name, **legacy_kwargs)
+
+
+def build_transformers_trainer(model, training_args, train_dataset, tokenizer, data_collator):
+    """
+    Build Trainer in a way that is compatible across transformers versions.
+    """
+    signature = inspect.signature(Trainer.__init__)
+    accepted = {name for name in signature.parameters if name != "self"}
+
+    trainer_kwargs = {}
+
+    if "model" in accepted:
+        trainer_kwargs["model"] = model
+    else:
+        raise TypeError("Unsupported Trainer signature: missing model argument.")
+
+    if "args" in accepted:
+        trainer_kwargs["args"] = training_args
+    elif "training_args" in accepted:
+        trainer_kwargs["training_args"] = training_args
+    else:
+        raise TypeError("Unsupported Trainer signature: missing args/training_args.")
+
+    if "train_dataset" in accepted:
+        trainer_kwargs["train_dataset"] = train_dataset
+    elif "dataset" in accepted:
+        trainer_kwargs["dataset"] = train_dataset
+    else:
+        raise TypeError("Unsupported Trainer signature: missing train_dataset/dataset.")
+
+    if "tokenizer" in accepted:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in accepted:
+        trainer_kwargs["processing_class"] = tokenizer
+    elif "processor" in accepted:
+        trainer_kwargs["processor"] = tokenizer
+
+    if "data_collator" in accepted:
+        trainer_kwargs["data_collator"] = data_collator
+
+    return Trainer(**trainer_kwargs)
 
 
 def get_prompt_function(method):
@@ -348,10 +408,13 @@ def train_sft(
     }
     if config.get("quantization"):
         model_kwargs["quantization_config"] = config["quantization"]
-    elif config.get("dtype"):
-        model_kwargs["torch_dtype"] = config["dtype"]
+    dtype_value = config.get("dtype")
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    model = load_causal_lm_with_dtype_fallback(
+        model_name=model_name,
+        model_kwargs=model_kwargs,
+        dtype_value=dtype_value,
+    )
     model.config.pad_token_id = tokenizer.pad_token_id
 
     quantized = bool(config.get("quantization"))
@@ -434,9 +497,9 @@ def train_sft(
         seed=42,
     )
 
-    trainer = Trainer(
+    trainer = build_transformers_trainer(
         model=model,
-        args=training_args,
+        training_args=training_args,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
         data_collator=SFTDataCollator(tokenizer),
