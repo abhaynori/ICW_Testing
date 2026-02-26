@@ -80,6 +80,7 @@ python grpo_train.py --model small --method acrostics --epochs 5 --samples 200
 | Out of memory | `--batch-size 2` or `--model cpu` |
 | Too slow | `--samples 50` or use GPU |
 | No improvement | `--epochs 5 --samples 200` |
+| CUDA assert / invalid probs | `--use-lora --learning-rate 2e-6 --num-generations 2 --max-new-tokens 128` |
 
 ## Full Documentation
 

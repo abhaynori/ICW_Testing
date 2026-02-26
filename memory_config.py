@@ -12,6 +12,14 @@ HAS_MPS = torch.backends.mps.is_available()  # Apple Silicon
 print(f"CUDA available: {HAS_CUDA}")
 print(f"MPS (Apple Silicon) available: {HAS_MPS}")
 
+
+def _get_preferred_full_dtype():
+    """Prefer bf16 on supported CUDA GPUs for better numerical stability."""
+    if HAS_CUDA and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 # Memory profiles for different models
 MODEL_PROFILES = {
     "qwen-2.5-7b": {
@@ -98,7 +106,7 @@ def get_model_config(strategy="auto"):
             "model_name": "Qwen/Qwen2.5-7B-Instruct",
             "quantization": None,
             "device_map": "auto",
-            "dtype": torch.float16,
+            "dtype": _get_preferred_full_dtype(),
             "description": "Full precision - needs 13GB+ VRAM"
         }
     

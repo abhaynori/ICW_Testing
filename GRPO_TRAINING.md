@@ -94,6 +94,10 @@ python grpo_train.py [OPTIONS]
 | `--epochs` | 3 | Number of training epochs |
 | `--batch-size` | 4 | Training batch size |
 | `--learning-rate` | 1e-5 | Learning rate |
+| `--num-generations` | 4 | Rollout samples per prompt for GRPO |
+| `--max-new-tokens` | 200 | Max tokens per sampled completion |
+| `--temperature` | 0.7 | Sampling temperature during GRPO rollouts |
+| `--top-p` | 0.9 | Nucleus sampling cutoff during GRPO rollouts |
 | `--output-dir` | grpo_models | Output directory |
 | `--eval-splits` | validation,test | Comma-separated splits to evaluate post-training |
 | `--eval-samples` | 50 | Samples per evaluation split |
@@ -307,6 +311,27 @@ python grpo_train.py --model small --method unicode --learning-rate 5e-6 --epoch
 1. TRL installed: `pip install trl accelerate peft`
 2. Enough disk space for model checkpoints
 3. Using compatible model (not 4bit)
+
+### Issue: `CUDA error: device-side assert triggered` during GRPO sampling
+
+This is usually policy instability (invalid logits) during rollout generation.
+
+**Try this stability profile first:**
+```bash
+python grpo_train.py \
+  --model full \
+  --method acrostics \
+  --warm-start-model <path_to_sft_model> \
+  --use-lora \
+  --learning-rate 2e-6 \
+  --batch-size 2 \
+  --num-generations 2 \
+  --max-new-tokens 128
+```
+
+Notes:
+- `--num-generations` and `--max-new-tokens` reduce rollout variance and memory pressure.
+- Invalid-logit filtering is enabled by default; only disable it with `--allow-invalid-logits` for debugging.
 
 ## Advanced Usage
 

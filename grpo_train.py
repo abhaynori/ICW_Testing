@@ -276,6 +276,24 @@ def _format_alpaca_query(example):
     return instruction
 
 
+def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=None):
+    """
+    Load CausalLM model while handling dtype argument differences across
+    transformers versions (`dtype` vs `torch_dtype`).
+    """
+    if dtype_value is None:
+        return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+    modern_kwargs = dict(model_kwargs)
+    modern_kwargs["dtype"] = dtype_value
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_name, **modern_kwargs)
+    except TypeError:
+        legacy_kwargs = dict(model_kwargs)
+        legacy_kwargs["torch_dtype"] = dtype_value
+        return AutoModelForCausalLM.from_pretrained(model_name, **legacy_kwargs)
+
+
 def build_grpo_config(base_training_args, generation_args, num_generations=4):
     """
     Build GRPOConfig in a way that is compatible across TRL versions.
@@ -284,23 +302,28 @@ def build_grpo_config(base_training_args, generation_args, num_generations=4):
     accepted = {name for name in signature.parameters if name != "self"}
 
     config_kwargs = {}
+    consumed_keys = set()
     for key, value in base_training_args.items():
         if key in accepted:
             config_kwargs[key] = value
+            consumed_keys.add(key)
 
     # Generation controls vary heavily across TRL versions.
     if "generation_kwargs" in accepted:
         config_kwargs["generation_kwargs"] = dict(generation_args)
+        consumed_keys.update(generation_args.keys())
     else:
         for key, value in generation_args.items():
             if key in accepted:
                 config_kwargs[key] = value
+                consumed_keys.add(key)
         if (
             "max_completion_length" in accepted
             and "max_new_tokens" in generation_args
             and "max_completion_length" not in config_kwargs
         ):
             config_kwargs["max_completion_length"] = generation_args["max_new_tokens"]
+            consumed_keys.add("max_new_tokens")
 
     # Number of completions field name changed across versions.
     if "num_generations" in accepted:
@@ -310,9 +333,7 @@ def build_grpo_config(base_training_args, generation_args, num_generations=4):
     elif "num_return_sequences" in accepted:
         config_kwargs["num_return_sequences"] = num_generations
 
-    dropped = sorted(
-        set(base_training_args).union(generation_args) - set(config_kwargs)
-    )
+    dropped = sorted(set(base_training_args).union(generation_args) - consumed_keys)
     if dropped:
         warnings.warn(
             "Ignoring unsupported GRPOConfig args for this TRL version: "
@@ -678,7 +699,12 @@ def train_grpo(
     shaping_partial_weight=0.25,
     shaping_length_weight=0.05,
     shaping_target_words=120,
-    max_abs_reward=10.0
+    max_abs_reward=10.0,
+    num_generations=4,
+    max_new_tokens=200,
+    generation_temperature=0.7,
+    generation_top_p=0.9,
+    remove_invalid_values=True
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -700,6 +726,11 @@ def train_grpo(
         reference_model_path: Optional override for KL reference policy
         disable_reference_model: Disable explicit KL reference model loading
         reward_shaping: Add explicit shaping terms for partial progress/format/length
+        num_generations: Number of sampled completions per prompt
+        max_new_tokens: Max tokens generated per completion
+        generation_temperature: Sampling temperature used during GRPO rollouts
+        generation_top_p: Nucleus sampling top-p used during GRPO rollouts
+        remove_invalid_values: Filter inf/nan logits during generation for stability
     """
 
     valid_prompt_variants = {"paper", "concise", "strict"}
@@ -737,7 +768,12 @@ def train_grpo(
     print(f"Epochs: {num_epochs}")
     print(f"Batch Size: {batch_size}")
     print(f"Generation Batch Size: {generation_batch_size}")
+    print(f"Num Generations / Prompt: {num_generations}")
     print(f"Learning Rate: {learning_rate}")
+    print(
+        "Generation Params (max_new_tokens/temperature/top_p/remove_invalid_values): "
+        f"{max_new_tokens}/{generation_temperature}/{generation_top_p}/{remove_invalid_values}"
+    )
     print(f"Prompt Variant: {prompt_variant}")
     print(f"Rules Variant: {rules_variant}")
     print(f"Use LoRA: {use_lora}")
@@ -772,6 +808,7 @@ def train_grpo(
     # Load model and tokenizer
     print("Loading base model...")
     config = get_model_config(model_strategy)
+    config = dict(config)
     model_name = config["model_name"]
     policy_model_path = warm_start_model_path or model_name
     if warm_start_model_path:
@@ -800,17 +837,34 @@ def train_grpo(
         "low_cpu_mem_usage": True
     }
 
+    use_cuda = torch.cuda.is_available()
+    supports_bf16 = bool(use_cuda and torch.cuda.is_bf16_supported())
+
     # Note: GRPO training works best with full precision or 8-bit
     # 4-bit quantization may not work well with gradient updates
     if model_strategy == "4bit":
         print("⚠️  Warning: 4-bit models may not train well. Consider using 'small' or '8bit'")
+    if model_strategy == "full" and not use_lora and learning_rate > 3e-6:
+        warnings.warn(
+            "Full-parameter GRPO with learning_rate > 3e-6 is often unstable "
+            "(NaN logits / CUDA asserts). Consider --use-lora or lowering "
+            "--learning-rate to 1e-6..3e-6."
+        )
 
+    dtype_value = config.get("dtype")
+    if model_strategy == "full" and supports_bf16:
+        # Prefer bf16 on modern GPUs; it is materially more stable than fp16 for RLHF-style updates.
+        dtype_value = torch.bfloat16
+        config["dtype"] = dtype_value
     if config.get("quantization"):
         model_kwargs["quantization_config"] = config["quantization"]
-    elif config.get("dtype"):
-        model_kwargs["torch_dtype"] = config["dtype"]
+        dtype_value = None
 
-    model = AutoModelForCausalLM.from_pretrained(policy_model_path, **model_kwargs)
+    model = load_causal_lm_with_dtype_fallback(
+        model_name=policy_model_path,
+        model_kwargs=model_kwargs,
+        dtype_value=dtype_value,
+    )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -849,7 +903,11 @@ def train_grpo(
     if reference_source:
         print(f"Loading KL reference model from: {reference_source}")
         reference_kwargs = dict(model_kwargs)
-        reference_model = AutoModelForCausalLM.from_pretrained(reference_source, **reference_kwargs)
+        reference_model = load_causal_lm_with_dtype_fallback(
+            model_name=reference_source,
+            model_kwargs=reference_kwargs,
+            dtype_value=dtype_value,
+        )
         reference_model.eval()
         for parameter in reference_model.parameters():
             parameter.requires_grad_(False)
@@ -921,16 +979,19 @@ def train_grpo(
         "warmup_steps": 10,
         "max_grad_norm": 1.0,
         "seed": 42,
+        "bf16": bool(use_cuda and supports_bf16 and config.get("quantization") is None),
+        "fp16": bool(use_cuda and (not supports_bf16) and config.get("quantization") is None),
     }
     generation_args = {
-        "max_new_tokens": 200,
-        "temperature": 0.7,
-        "top_p": 0.9,
+        "max_new_tokens": max_new_tokens,
+        "temperature": generation_temperature,
+        "top_p": generation_top_p,
+        "remove_invalid_values": remove_invalid_values,
     }
     training_args = build_grpo_config(
         base_training_args=base_training_args,
         generation_args=generation_args,
-        num_generations=4,
+        num_generations=num_generations,
     )
 
     # Initialize GRPO Trainer
@@ -992,6 +1053,12 @@ def train_grpo(
         "shaping_length_weight": shaping_length_weight if reward_shaping else None,
         "shaping_target_words": shaping_target_words if reward_shaping else None,
         "max_abs_reward": max_abs_reward,
+        "num_generations": num_generations,
+        "max_new_tokens": max_new_tokens,
+        "generation_temperature": generation_temperature,
+        "generation_top_p": generation_top_p,
+        "remove_invalid_values": remove_invalid_values,
+        "policy_dtype": str(dtype_value) if dtype_value is not None else None,
         "baseline_mean": baseline_mean,
         "baseline_std": baseline_std,
         "timestamp": datetime.now().isoformat()
@@ -1163,6 +1230,42 @@ Examples:
     )
 
     parser.add_argument(
+        '--num-generations',
+        type=int,
+        default=4,
+        help='Number of sampled completions per prompt during GRPO (default: 4)'
+    )
+
+    parser.add_argument(
+        '--max-new-tokens',
+        type=int,
+        default=200,
+        help='Max tokens generated per completion during GRPO (default: 200)'
+    )
+
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=0.7,
+        help='Sampling temperature for GRPO rollouts (default: 0.7)'
+    )
+
+    parser.add_argument(
+        '--top-p',
+        type=float,
+        default=0.9,
+        help='Top-p for GRPO rollout sampling (default: 0.9)'
+    )
+
+    parser.add_argument(
+        '--allow-invalid-logits',
+        dest='remove_invalid_values',
+        action='store_false',
+        default=True,
+        help='Disable invalid-logit filtering (not recommended; default keeps filtering on)'
+    )
+
+    parser.add_argument(
         '--prompt-variant',
         type=str,
         default='paper',
@@ -1305,6 +1408,14 @@ Examples:
 
     if args.gen_batch_size < 1:
         parser.error("--gen-batch-size must be >= 1")
+    if args.num_generations < 1:
+        parser.error("--num-generations must be >= 1")
+    if args.max_new_tokens < 1:
+        parser.error("--max-new-tokens must be >= 1")
+    if args.temperature <= 0:
+        parser.error("--temperature must be > 0")
+    if not (0 < args.top_p <= 1):
+        parser.error("--top-p must be in (0, 1]")
     if args.lora_rank < 1:
         parser.error("--lora-rank must be >= 1")
     if args.lora_alpha < 1:
@@ -1350,7 +1461,12 @@ Examples:
         shaping_partial_weight=args.shaping_partial_weight,
         shaping_length_weight=args.shaping_length_weight,
         shaping_target_words=args.shaping_target_words,
-        max_abs_reward=args.max_abs_reward
+        max_abs_reward=args.max_abs_reward,
+        num_generations=args.num_generations,
+        max_new_tokens=args.max_new_tokens,
+        generation_temperature=args.temperature,
+        generation_top_p=args.top_p,
+        remove_invalid_values=args.remove_invalid_values
     )
 
     print("\n" + "="*80)
