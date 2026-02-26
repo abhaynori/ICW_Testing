@@ -297,12 +297,34 @@ def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=Non
 def _looks_like_local_path(source):
     if source is None:
         return False
-    if source.startswith((".", "/", "~")):
+    value = str(source).strip()
+    if not value:
+        return False
+
+    if value.startswith((".", "/", "~")):
         return True
-    if os.sep in source:
+
+    # Windows absolute paths (e.g., C:\foo\bar)
+    if re.match(r"^[a-zA-Z]:[\\/]", value):
         return True
-    if os.altsep and os.altsep in source:
+
+    normalized = value.replace("\\", "/")
+    if "/" not in normalized:
+        return False
+
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) >= 3:
         return True
+
+    # Trailing slash generally indicates a filesystem path intent.
+    if value.endswith(("/", "\\")):
+        return True
+
+    # Two-part strings can be either local relative paths or HF repo ids.
+    # Treat as local only if the top-level segment exists in cwd.
+    if len(parts) == 2:
+        return os.path.exists(parts[0])
+
     return False
 
 
@@ -388,7 +410,8 @@ def build_grpo_trainer(
     train_dataset,
     tokenizer,
     reward_fn,
-    reference_model=None
+    reference_model=None,
+    require_explicit_reference=False
 ):
     """
     Build GRPOTrainer in a way that is compatible across TRL versions.
@@ -397,6 +420,10 @@ def build_grpo_trainer(
     accepted = {name for name in signature.parameters if name != "self"}
 
     trainer_kwargs = {}
+    trainer_accepts_reference_arg = (
+        "ref_model" in accepted or "reference_model" in accepted
+    )
+    explicit_reference_arg_used = False
 
     if "model" in accepted:
         trainer_kwargs["model"] = model
@@ -425,12 +452,25 @@ def build_grpo_trainer(
     if reference_model is not None:
         if "ref_model" in accepted:
             trainer_kwargs["ref_model"] = reference_model
+            explicit_reference_arg_used = True
         elif "reference_model" in accepted:
             trainer_kwargs["reference_model"] = reference_model
+            explicit_reference_arg_used = True
         else:
-            warnings.warn(
+            message = (
                 "Reference model was requested, but this TRL version does not expose "
-                "a ref_model/reference_model argument. Falling back to default KL reference behavior."
+                "a ref_model/reference_model argument."
+            )
+            if require_explicit_reference:
+                raise RuntimeError(
+                    message
+                    + " Explicit reference usage is required, so aborting. "
+                    + "Upgrade/downgrade TRL to a version whose GRPOTrainer accepts "
+                    + "ref_model/reference_model."
+                )
+            warnings.warn(
+                message
+                + " Falling back to default KL reference behavior."
             )
 
     reward_attempts = []
@@ -450,10 +490,16 @@ def build_grpo_trainer(
     last_error = None
     for reward_key, reward_value in reward_attempts:
         try:
-            return GRPOTrainer(
+            trainer = GRPOTrainer(
                 **trainer_kwargs,
                 **{reward_key: reward_value},
             )
+            # Persist compatibility details for downstream logging/metadata.
+            trainer._icw_trainer_accepts_reference_arg = trainer_accepts_reference_arg
+            trainer._icw_explicit_reference_arg_used = bool(
+                reference_model is not None and explicit_reference_arg_used
+            )
+            return trainer
         except TypeError as exc:
             last_error = exc
 
@@ -743,7 +789,8 @@ def train_grpo(
     max_new_tokens=200,
     generation_temperature=0.7,
     generation_top_p=0.9,
-    remove_invalid_values=True
+    remove_invalid_values=True,
+    require_explicit_reference=True
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -770,6 +817,7 @@ def train_grpo(
         generation_temperature: Sampling temperature used during GRPO rollouts
         generation_top_p: Nucleus sampling top-p used during GRPO rollouts
         remove_invalid_values: Filter inf/nan logits during generation for stability
+        require_explicit_reference: Fail if TRL cannot consume explicit reference model args
     """
 
     valid_prompt_variants = {"paper", "concise", "strict"}
@@ -825,6 +873,7 @@ def train_grpo(
     else:
         kl_reference_text = reference_model_path or "Auto"
     print(f"KL Reference Override: {kl_reference_text}")
+    print(f"Require Explicit Reference: {require_explicit_reference}")
     print(f"Reward Shaping: {reward_shaping}")
     if reward_shaping:
         print(
@@ -910,27 +959,32 @@ def train_grpo(
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = tokenizer.eos_token_id
 
+    existing_peft_adapters = bool(getattr(model, "peft_config", None))
+
     if use_lora:
         if LoraConfig is None or get_peft_model is None or TaskType is None:
             raise ImportError(
                 "PEFT is required for LoRA training. Install dependencies with: pip install peft"
             )
-        target_modules = [item.strip() for item in lora_target_modules.split(",") if item.strip()]
-        if not target_modules:
-            raise ValueError("LoRA target modules cannot be empty.")
+        if existing_peft_adapters:
+            print("✓ Existing PEFT adapters detected in warm-start checkpoint; reusing them.")
+        else:
+            target_modules = [item.strip() for item in lora_target_modules.split(",") if item.strip()]
+            if not target_modules:
+                raise ValueError("LoRA target modules cannot be empty.")
 
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=target_modules,
-            bias="none"
-        )
-        model = get_peft_model(model, lora_config)
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=target_modules,
+                bias="none"
+            )
+            model = get_peft_model(model, lora_config)
+            print("✓ LoRA adapters attached")
         if hasattr(model, "print_trainable_parameters"):
             model.print_trainable_parameters()
-        print("✓ LoRA adapters attached")
 
     print("✓ Policy model loaded successfully!\n")
 
@@ -1044,7 +1098,31 @@ def train_grpo(
         tokenizer=tokenizer,
         reward_fn=reward_fn,
         reference_model=reference_model,
+        require_explicit_reference=require_explicit_reference,
     )
+
+    trainer_accepts_reference_arg = bool(
+        getattr(trainer, "_icw_trainer_accepts_reference_arg", False)
+    )
+    explicit_reference_arg_used = bool(
+        getattr(trainer, "_icw_explicit_reference_arg_used", False)
+    )
+
+    if reference_model is not None:
+        if explicit_reference_arg_used:
+            print("✓ Explicit KL reference model is being used by this TRL version.")
+        elif not trainer_accepts_reference_arg:
+            print(
+                "⚠️  Explicit KL reference model is NOT being passed to GRPOTrainer "
+                "(TRL lacks ref_model/reference_model in this version)."
+            )
+        else:
+            print(
+                "⚠️  Explicit KL reference model may not be active "
+                "(trainer accepted reference args but none were attached)."
+            )
+    else:
+        print("ℹ️  No explicit KL reference model requested.")
 
     print("✓ Trainer initialized\n")
 
@@ -1073,6 +1151,9 @@ def train_grpo(
         "kl_reference_model_path": reference_source,
         "kl_reference_model_path_resolved": resolved_reference_source,
         "disable_reference_model": disable_reference_model,
+        "trainer_accepts_reference_arg": trainer_accepts_reference_arg,
+        "explicit_reference_arg_used": explicit_reference_arg_used,
+        "require_explicit_reference": require_explicit_reference,
         "model_strategy": model_strategy,
         "method": method,
         "num_train_samples": num_train_samples,
@@ -1086,6 +1167,7 @@ def train_grpo(
         "base_system_prompt": get_base_system_prompt(),
         "system_prompt_prefix": system_prompt_prefix or "",
         "use_lora": use_lora,
+        "existing_peft_adapters_in_policy_init": existing_peft_adapters,
         "lora_rank": lora_rank if use_lora else None,
         "lora_alpha": lora_alpha if use_lora else None,
         "lora_dropout": lora_dropout if use_lora else None,
@@ -1393,6 +1475,14 @@ Examples:
     )
 
     parser.add_argument(
+        '--allow-implicit-reference',
+        dest='require_explicit_reference',
+        action='store_false',
+        default=True,
+        help='Allow training when TRL cannot accept explicit ref_model/reference_model args'
+    )
+
+    parser.add_argument(
         '--reward-shaping',
         action='store_true',
         help='Enable explicit reward shaping terms (format/partial/length)'
@@ -1509,7 +1599,8 @@ Examples:
         max_new_tokens=args.max_new_tokens,
         generation_temperature=args.temperature,
         generation_top_p=args.top_p,
-        remove_invalid_values=args.remove_invalid_values
+        remove_invalid_values=args.remove_invalid_values,
+        require_explicit_reference=args.require_explicit_reference
     )
 
     print("\n" + "="*80)
