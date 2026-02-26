@@ -294,6 +294,45 @@ def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=Non
         return AutoModelForCausalLM.from_pretrained(model_name, **legacy_kwargs)
 
 
+def _looks_like_local_path(source):
+    if source is None:
+        return False
+    if source.startswith((".", "/", "~")):
+        return True
+    if os.sep in source:
+        return True
+    if os.altsep and os.altsep in source:
+        return True
+    return False
+
+
+def resolve_pretrained_source(source, label):
+    """
+    Resolve local model paths safely and keep HF repo ids untouched.
+    """
+    if source is None:
+        return None
+
+    raw = str(source).strip()
+    if not raw:
+        raise ValueError(f"{label} cannot be empty.")
+
+    expanded = os.path.expanduser(raw)
+    normalized = os.path.normpath(expanded)
+    if os.path.exists(normalized):
+        return normalized
+
+    if _looks_like_local_path(raw):
+        abs_candidate = os.path.abspath(normalized)
+        raise FileNotFoundError(
+            f"{label} path not found: '{raw}'. "
+            f"Resolved as: '{abs_candidate}'. "
+            f"Current working directory: '{os.getcwd()}'."
+        )
+
+    return raw
+
+
 def build_grpo_config(base_training_args, generation_args, num_generations=4):
     """
     Build GRPOConfig in a way that is compatible across TRL versions.
@@ -811,11 +850,12 @@ def train_grpo(
     config = dict(config)
     model_name = config["model_name"]
     policy_model_path = warm_start_model_path or model_name
+    resolved_policy_source = resolve_pretrained_source(policy_model_path, "Policy model")
     if warm_start_model_path:
-        print(f"Warm-starting policy from: {warm_start_model_path}")
+        print(f"Warm-starting policy from: {resolved_policy_source}")
         print(f"KL default reference will remain base instruct model: {model_name}")
 
-    tokenizer_source = policy_model_path
+    tokenizer_source = resolved_policy_source
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
     except Exception:
@@ -861,7 +901,7 @@ def train_grpo(
         dtype_value = None
 
     model = load_causal_lm_with_dtype_fallback(
-        model_name=policy_model_path,
+        model_name=resolved_policy_source,
         model_kwargs=model_kwargs,
         dtype_value=dtype_value,
     )
@@ -898,13 +938,14 @@ def train_grpo(
     reference_source = None if disable_reference_model else reference_model_path
     if reference_source is None and warm_start_model_path:
         reference_source = model_name
+    resolved_reference_source = resolve_pretrained_source(reference_source, "Reference model")
 
     reference_model = None
-    if reference_source:
-        print(f"Loading KL reference model from: {reference_source}")
+    if resolved_reference_source:
+        print(f"Loading KL reference model from: {resolved_reference_source}")
         reference_kwargs = dict(model_kwargs)
         reference_model = load_causal_lm_with_dtype_fallback(
-            model_name=reference_source,
+            model_name=resolved_reference_source,
             model_kwargs=reference_kwargs,
             dtype_value=dtype_value,
         )
@@ -1027,8 +1068,10 @@ def train_grpo(
     metadata = {
         "base_model": model_name,
         "policy_model_init": policy_model_path,
+        "policy_model_init_resolved": resolved_policy_source,
         "warm_start_model_path": warm_start_model_path,
         "kl_reference_model_path": reference_source,
+        "kl_reference_model_path_resolved": resolved_reference_source,
         "disable_reference_model": disable_reference_model,
         "model_strategy": model_strategy,
         "method": method,
