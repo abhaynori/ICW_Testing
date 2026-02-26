@@ -466,7 +466,9 @@ def build_grpo_trainer(
                     message
                     + " Explicit reference usage is required, so aborting. "
                     + "Upgrade/downgrade TRL to a version whose GRPOTrainer accepts "
-                    + "ref_model/reference_model."
+                    + "ref_model/reference_model. "
+                    + "If you can tolerate implicit reference handling, rerun with "
+                    + "--allow-implicit-reference --beta 0.04."
                 )
             warnings.warn(
                 message
@@ -790,7 +792,8 @@ def train_grpo(
     generation_temperature=0.7,
     generation_top_p=0.9,
     remove_invalid_values=True,
-    require_explicit_reference=True
+    require_explicit_reference=True,
+    beta=0.04
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -818,6 +821,7 @@ def train_grpo(
         generation_top_p: Nucleus sampling top-p used during GRPO rollouts
         remove_invalid_values: Filter inf/nan logits during generation for stability
         require_explicit_reference: Fail if TRL cannot consume explicit reference model args
+        beta: KL coefficient. Must be >0 to ensure reference policy contributes to loss.
     """
 
     valid_prompt_variants = {"paper", "concise", "strict"}
@@ -874,6 +878,7 @@ def train_grpo(
         kl_reference_text = reference_model_path or "Auto"
     print(f"KL Reference Override: {kl_reference_text}")
     print(f"Require Explicit Reference: {require_explicit_reference}")
+    print(f"KL Beta: {beta}")
     print(f"Reward Shaping: {reward_shaping}")
     if reward_shaping:
         print(
@@ -1074,6 +1079,7 @@ def train_grpo(
         "warmup_steps": 10,
         "max_grad_norm": 1.0,
         "seed": 42,
+        "beta": beta,
         "bf16": bool(use_cuda and supports_bf16 and config.get("quantization") is None),
         "fp16": bool(use_cuda and (not supports_bf16) and config.get("quantization") is None),
     }
@@ -1112,9 +1118,19 @@ def train_grpo(
         if explicit_reference_arg_used:
             print("✓ Explicit KL reference model is being used by this TRL version.")
         elif not trainer_accepts_reference_arg:
+            if beta <= 0:
+                raise RuntimeError(
+                    "TRL cannot accept explicit ref_model/reference_model in this version, "
+                    "and beta <= 0 disables KL/reference contribution. "
+                    "Set --beta > 0 (e.g., 0.04) or use a TRL version with explicit "
+                    "reference-model support."
+                )
             print(
                 "⚠️  Explicit KL reference model is NOT being passed to GRPOTrainer "
                 "(TRL lacks ref_model/reference_model in this version)."
+            )
+            print(
+                "✓ Using TRL internal reference mechanism because beta > 0."
             )
         else:
             print(
@@ -1178,6 +1194,7 @@ def train_grpo(
         "shaping_length_weight": shaping_length_weight if reward_shaping else None,
         "shaping_target_words": shaping_target_words if reward_shaping else None,
         "max_abs_reward": max_abs_reward,
+        "beta": beta,
         "num_generations": num_generations,
         "max_new_tokens": max_new_tokens,
         "generation_temperature": generation_temperature,
@@ -1352,6 +1369,13 @@ Examples:
         type=float,
         default=1e-5,
         help='Learning rate (default: 1e-5)'
+    )
+
+    parser.add_argument(
+        '--beta',
+        type=float,
+        default=0.04,
+        help='KL coefficient for GRPO reference policy (default: 0.04)'
     )
 
     parser.add_argument(
@@ -1541,6 +1565,8 @@ Examples:
 
     if args.gen_batch_size < 1:
         parser.error("--gen-batch-size must be >= 1")
+    if args.beta < 0:
+        parser.error("--beta must be >= 0")
     if args.num_generations < 1:
         parser.error("--num-generations must be >= 1")
     if args.max_new_tokens < 1:
@@ -1600,7 +1626,8 @@ Examples:
         generation_temperature=args.temperature,
         generation_top_p=args.top_p,
         remove_invalid_values=args.remove_invalid_values,
-        require_explicit_reference=args.require_explicit_reference
+        require_explicit_reference=args.require_explicit_reference,
+        beta=args.beta
     )
 
     print("\n" + "="*80)
