@@ -74,10 +74,10 @@ class WatermarkRewardFunction:
         baseline_mean=0.0,
         baseline_std=1.0,
         detector_weight=1.0,
-        reward_shaping=False,
+        reward_shaping=True,
         shaping_format_weight=0.10,
-        shaping_partial_weight=0.25,
-        shaping_length_weight=0.05,
+        shaping_partial_weight=0.40,
+        shaping_length_weight=0.10,
         shaping_target_words=120,
         max_abs_reward=10.0
     ):
@@ -200,6 +200,25 @@ class WatermarkRewardFunction:
 
         return 0.0
 
+    def _acrostics_sentence_reward(self, text):
+        """Per-sentence binary match reward for acrostics.
+
+        Returns the fraction of sentences whose first letter matches the
+        corresponding position in the repeating SECRET pattern.  Gives a
+        smooth [0, 1] signal that is far more informative for GRPO than the
+        global Levenshtein-based detector.
+        """
+        sentences = self._split_sentences(text)
+        if not sentences:
+            return 0.0
+        secret = "".join(secret_sequence).upper()
+        matches = 0
+        for i, sent in enumerate(sentences):
+            words = self._safe_words(sent)
+            if words and words[0][0].upper() == secret[i % len(secret)]:
+                matches += 1
+        return matches / len(sentences)
+
     def _length_score(self, text):
         words = self._safe_words(text)
         return min(len(words) / float(self.shaping_target_words), 1.0)
@@ -217,8 +236,12 @@ class WatermarkRewardFunction:
         texts = self._extract_texts(args, kwargs)
         rewards = []
         for text in texts:
-            # Get detector score
-            score = self.detector(text, *self.detector_args)
+            # For acrostics, use per-sentence binary match (smoother for RL)
+            # instead of the global Levenshtein-based detector.
+            if self.method == "acrostics":
+                score = self._acrostics_sentence_reward(text)
+            else:
+                score = self.detector(text, *self.detector_args)
 
             # Normalize by baseline (z-score style)
             # Higher scores = better watermarking
@@ -510,21 +533,47 @@ def build_grpo_trainer(
     raise RuntimeError("Failed to initialize GRPOTrainer for unknown reasons.")
 
 
-def prepare_dataset(num_samples=100, split="train", dataset_name="eli5"):
-    """Prepare training/eval dataset from ELI5 or Alpaca."""
+def prepare_dataset(num_samples=100, split="train", dataset_name="eli5", seed=42):
+    """Prepare training/eval dataset from ELI5, Alpaca, or a mixed pool."""
     dataset_key = dataset_name.strip().lower()
     print(f"Loading {num_samples} samples from {dataset_key} ({split})...")
     try:
         if dataset_key == "eli5":
-            dataset = load_dataset("sentence-transformers/eli5", "pair", split=split)
-            queries = dataset["question"][:num_samples]
+            # Some environments expose only the train split for this dataset config.
+            # Mirror Alpaca behavior by slicing train into train/validation/test.
+            dataset = load_dataset("sentence-transformers/eli5", "pair", split="train")
+            start, end = _slice_indices_for_split(len(dataset), split)
+            sampled = dataset.select(range(start, min(end, start + num_samples)))
+            queries = sampled["question"]
         elif dataset_key == "alpaca":
             dataset = load_dataset("yahma/alpaca-cleaned", split="train")
             start, end = _slice_indices_for_split(len(dataset), split)
             sampled = dataset.select(range(start, min(end, start + num_samples)))
             queries = [_format_alpaca_query(row) for row in sampled]
+        elif dataset_key == "mixed":
+            eli5_target = max(1, num_samples // 2)
+            alpaca_target = max(1, num_samples - eli5_target)
+
+            eli5_dataset = load_dataset("sentence-transformers/eli5", "pair", split="train")
+            eli5_start, eli5_end = _slice_indices_for_split(len(eli5_dataset), split)
+            eli5_subset = eli5_dataset.select(range(eli5_start, min(eli5_end, eli5_start + eli5_target)))
+            eli5_queries = list(eli5_subset["question"])
+
+            alpaca_dataset = load_dataset("yahma/alpaca-cleaned", split="train")
+            alpaca_start, alpaca_end = _slice_indices_for_split(len(alpaca_dataset), split)
+            alpaca_subset = alpaca_dataset.select(range(alpaca_start, min(alpaca_end, alpaca_start + alpaca_target)))
+            alpaca_queries = [_format_alpaca_query(row) for row in alpaca_subset]
+
+            queries = eli5_queries + alpaca_queries
+            if len(queries) < num_samples:
+                warnings.warn(
+                    f"Requested {num_samples} mixed samples but only loaded {len(queries)} "
+                    f"(eli5={len(eli5_queries)}, alpaca={len(alpaca_queries)})."
+                )
+            rng = np.random.default_rng(seed)
+            rng.shuffle(queries)
         else:
-            raise ValueError("dataset_name must be 'eli5' or 'alpaca'")
+            raise ValueError("dataset_name must be 'eli5', 'alpaca', or 'mixed'")
     except Exception as exc:
         print(f"⚠️  Could not load dataset '{dataset_key}' split '{split}': {exc}")
         return None
@@ -616,11 +665,17 @@ def compute_baseline_statistics(
     dataset,
     method,
     num_samples=50,
-    generation_batch_size=4
+    generation_batch_size=4,
+    reward_override_fn=None
 ):
     """
     Compute baseline statistics from non-watermarked generations.
     These are used to normalize rewards.
+
+    Args:
+        reward_override_fn: Optional callable(text) -> float.  When provided,
+            this is used instead of the standard detector to compute scores.
+            Used for acrostics to align baselines with the per-sentence reward.
     """
     print(f"\nComputing baseline statistics for {method}...")
 
@@ -646,7 +701,10 @@ def compute_baseline_statistics(
         )
 
         for response in responses:
-            score = detector(response, *detector_args)
+            if reward_override_fn is not None:
+                score = reward_override_fn(response)
+            else:
+                score = detector(response, *detector_args)
             scores.append(score)
 
         processed = end
@@ -781,10 +839,10 @@ def train_grpo(
     warm_start_model_path=None,
     reference_model_path=None,
     disable_reference_model=False,
-    reward_shaping=False,
+    reward_shaping=True,
     shaping_format_weight=0.10,
-    shaping_partial_weight=0.25,
-    shaping_length_weight=0.05,
+    shaping_partial_weight=0.40,
+    shaping_length_weight=0.10,
     shaping_target_words=120,
     max_abs_reward=10.0,
     num_generations=4,
@@ -793,7 +851,9 @@ def train_grpo(
     generation_top_p=0.9,
     remove_invalid_values=True,
     require_explicit_reference=True,
-    beta=0.04
+    beta=0.04,
+    seed=42,
+    implicit_fraction=0.4
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -822,6 +882,10 @@ def train_grpo(
         remove_invalid_values: Filter inf/nan logits during generation for stability
         require_explicit_reference: Fail if TRL cannot consume explicit reference model args
         beta: KL coefficient. Must be >0 to ensure reference policy contributes to loss.
+        seed: Global experiment seed used for trainer + dataset sampling.
+        implicit_fraction: Fraction of training prompts WITHOUT watermark instructions.
+            These prompts still get rewarded for watermark quality, training the model
+            to produce watermarks without explicit instruction (internalization).
     """
 
     valid_prompt_variants = {"paper", "concise", "strict"}
@@ -860,6 +924,7 @@ def train_grpo(
     print(f"Batch Size: {batch_size}")
     print(f"Generation Batch Size: {generation_batch_size}")
     print(f"Num Generations / Prompt: {num_generations}")
+    print(f"Seed: {seed}")
     print(f"Learning Rate: {learning_rate}")
     print(
         "Generation Params (max_new_tokens/temperature/top_p/remove_invalid_values): "
@@ -887,6 +952,7 @@ def train_grpo(
         )
         print(f"Reward Shaping Target Words: {shaping_target_words}")
     print(f"Reward Clip |r|<= {max_abs_reward}")
+    print(f"Implicit Fraction: {implicit_fraction}")
     print(f"Eval Without Instructions: {eval_no_instruction}")
     print(f"Eval Splits: {eval_splits}")
     print(f"Eval Datasets: {eval_dataset_names}")
@@ -1017,19 +1083,27 @@ def train_grpo(
     dataset = prepare_dataset(
         num_samples=num_train_samples,
         split="train",
-        dataset_name=train_dataset_name
+        dataset_name=train_dataset_name,
+        seed=seed
     )
     if dataset is None:
         raise ValueError("Training dataset could not be loaded.")
 
     # Compute baseline statistics
+    # For acrostics, use the per-sentence reward for baselines so they match
+    # the training reward distribution (not the Levenshtein-based detector).
+    _baseline_reward_override = None
+    if method == "acrostics":
+        _baseline_reward_override = WatermarkRewardFunction(method)._acrostics_sentence_reward
+
     baseline_mean, baseline_std = compute_baseline_statistics(
         model,
         tokenizer,
         dataset,
         method,
         num_samples=min(50, num_train_samples),
-        generation_batch_size=generation_batch_size
+        generation_batch_size=generation_batch_size,
+        reward_override_fn=_baseline_reward_override
     )
 
     # Create reward function
@@ -1048,13 +1122,20 @@ def train_grpo(
     # Get prompt function
     prompt_fn = get_prompt_function(method)
 
-    # Prepare prompts for training
+    # Prepare prompts for training (with mixed supervision support)
+    _implicit_rng = np.random.default_rng(seed + 1000)
+
     def tokenize_function(examples):
-        """Convert queries to prompts with watermarking instructions."""
+        """Convert queries to prompts, mixing instructed and implicit modes."""
         prompts = []
         for query in examples["query"]:
-            messages = prompt_fn(query)
-            # Format as chat template
+            if implicit_fraction > 0 and _implicit_rng.random() < implicit_fraction:
+                # No watermark instruction — base system prompt only.
+                # The reward still scores watermark quality, training the
+                # model to produce watermarks without explicit instruction.
+                messages = build_messages(query, include_instruction=False)
+            else:
+                messages = prompt_fn(query)
             prompt_text = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -1078,7 +1159,7 @@ def train_grpo(
         "gradient_accumulation_steps": 4,
         "warmup_steps": 10,
         "max_grad_norm": 1.0,
-        "seed": 42,
+        "seed": seed,
         "beta": beta,
         "bf16": bool(use_cuda and supports_bf16 and config.get("quantization") is None),
         "fp16": bool(use_cuda and (not supports_bf16) and config.get("quantization") is None),
@@ -1174,6 +1255,7 @@ def train_grpo(
         "method": method,
         "num_train_samples": num_train_samples,
         "num_epochs": num_epochs,
+        "seed": seed,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "train_dataset_name": train_dataset_name,
@@ -1201,6 +1283,7 @@ def train_grpo(
         "generation_top_p": generation_top_p,
         "remove_invalid_values": remove_invalid_values,
         "policy_dtype": str(dtype_value) if dtype_value is not None else None,
+        "implicit_fraction": implicit_fraction,
         "baseline_mean": baseline_mean,
         "baseline_std": baseline_std,
         "timestamp": datetime.now().isoformat()
@@ -1236,7 +1319,8 @@ def train_grpo(
                     eval_dataset = prepare_dataset(
                         num_samples=eval_samples,
                         split=split_name,
-                        dataset_name=dataset_name
+                        dataset_name=dataset_name,
+                        seed=seed
                     )
                     if eval_dataset is None:
                         print(f"⚠️  Skipping evaluation for {dataset_name}:{split_name}")
@@ -1331,8 +1415,15 @@ Examples:
         '--train-dataset',
         type=str,
         default='eli5',
-        choices=['eli5', 'alpaca'],
+        choices=['eli5', 'alpaca', 'mixed'],
         help='Dataset used for GRPO training (default: eli5)'
+    )
+
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='Random seed for trainer and dataset sampling (default: 42)'
     )
 
     parser.add_argument(
@@ -1509,7 +1600,14 @@ Examples:
     parser.add_argument(
         '--reward-shaping',
         action='store_true',
-        help='Enable explicit reward shaping terms (format/partial/length)'
+        default=True,
+        help='Enable reward shaping terms (default: enabled)'
+    )
+    parser.add_argument(
+        '--no-reward-shaping',
+        dest='reward_shaping',
+        action='store_false',
+        help='Disable reward shaping'
     )
 
     parser.add_argument(
@@ -1522,15 +1620,15 @@ Examples:
     parser.add_argument(
         '--shaping-partial-weight',
         type=float,
-        default=0.25,
-        help='Weight for partial-progress shaping reward (default: 0.25)'
+        default=0.40,
+        help='Weight for partial-progress shaping reward (default: 0.40)'
     )
 
     parser.add_argument(
         '--shaping-length-weight',
         type=float,
-        default=0.05,
-        help='Weight for length shaping reward (default: 0.05)'
+        default=0.10,
+        help='Weight for length shaping reward (default: 0.10)'
     )
 
     parser.add_argument(
@@ -1545,6 +1643,15 @@ Examples:
         type=float,
         default=10.0,
         help='Clip reward magnitude to this absolute value (default: 10.0)'
+    )
+
+    parser.add_argument(
+        '--implicit-fraction',
+        type=float,
+        default=0.4,
+        help='Fraction of training prompts WITHOUT watermark instructions (default: 0.4). '
+             'These prompts still get rewarded for watermark quality, training the model '
+             'to internalize watermarking behavior.'
     )
 
     parser.add_argument(
@@ -1565,6 +1672,8 @@ Examples:
 
     if args.gen_batch_size < 1:
         parser.error("--gen-batch-size must be >= 1")
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
     if args.beta < 0:
         parser.error("--beta must be >= 0")
     if args.num_generations < 1:
@@ -1587,6 +1696,8 @@ Examples:
         parser.error("--max-abs-reward must be > 0")
     if args.no_reference_model and args.reference_model is not None:
         parser.error("--reference-model cannot be set together with --no-reference-model")
+    if not (0.0 <= args.implicit_fraction <= 1.0):
+        parser.error("--implicit-fraction must be in [0.0, 1.0]")
 
     # Train
     model_path = train_grpo(
@@ -1627,7 +1738,9 @@ Examples:
         generation_top_p=args.top_p,
         remove_invalid_values=args.remove_invalid_values,
         require_explicit_reference=args.require_explicit_reference,
-        beta=args.beta
+        beta=args.beta,
+        seed=args.seed,
+        implicit_fraction=args.implicit_fraction
     )
 
     print("\n" + "="*80)

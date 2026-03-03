@@ -44,6 +44,8 @@ python grpo_train.py --model small --method lexical --epochs 3
 python grpo_train.py --model small --method acrostics --epochs 3
 ```
 
+Tip: use `--train-dataset mixed --seed <int>` for better cross-dataset generalization and reproducibility.
+
 ### Quick Test (Fast)
 
 ```bash

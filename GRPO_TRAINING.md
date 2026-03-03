@@ -94,6 +94,7 @@ python grpo_train.py [OPTIONS]
 | `--epochs` | 3 | Number of training epochs |
 | `--batch-size` | 4 | Training batch size |
 | `--learning-rate` | 1e-5 | Learning rate |
+| `--seed` | 42 | Seed for trainer + dataset sampling |
 | `--num-generations` | 4 | Rollout samples per prompt for GRPO |
 | `--max-new-tokens` | 200 | Max tokens per sampled completion |
 | `--temperature` | 0.7 | Sampling temperature during GRPO rollouts |
@@ -102,6 +103,8 @@ python grpo_train.py [OPTIONS]
 | `--eval-splits` | validation,test | Comma-separated splits to evaluate post-training |
 | `--eval-samples` | 50 | Samples per evaluation split |
 | `--eval-no-instruction` | false | Disable watermarking instructions during eval |
+
+`--train-dataset` supports `eli5`, `alpaca`, and `mixed` (50/50 ELI5+Alpaca with split-aware slicing).
 
 ### Important Notes
 
@@ -334,6 +337,18 @@ Notes:
 - Invalid-logit filtering is enabled by default; only disable it with `--allow-invalid-logits` for debugging.
 
 ## Advanced Usage
+
+### Publication Readiness Aggregation
+
+After running multiple seeds, aggregate results:
+
+```bash
+python assess_publication_readiness.py \
+  --runs-glob "grpo_models/acrostics_full_*" \
+  --required "eli5:validation,eli5:test,alpaca:validation,alpaca:test" \
+  --min-runs 3 \
+  --min-z 0.20
+```
 
 ### Custom Hyperparameters
 
