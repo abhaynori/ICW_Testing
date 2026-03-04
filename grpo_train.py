@@ -733,11 +733,20 @@ def evaluate_model_on_split(
     dataset_name="eli5",
     generation_batch_size=4,
     baseline_mean=None,
-    baseline_std=None
+    baseline_std=None,
+    reward_override_fn=None
 ):
-    """Evaluate detector scores on a dataset split."""
+    """Evaluate detector scores on a dataset split.
+
+    Args:
+        reward_override_fn: Optional callable(text) -> float.  When provided,
+            this is used as the *primary* scoring metric (for z-score
+            computation).  The standard detector score is still recorded
+            alongside it for paper-comparable ROC-AUC reporting.
+    """
     detector, detector_args = get_detector_and_args(method)
     scores = []
+    detector_scores = []
     records = []
 
     samples = dataset.select(range(min(max_samples, len(dataset))))
@@ -763,12 +772,20 @@ def evaluate_model_on_split(
         )
 
         for query, response in zip(batch_queries, responses):
-            score = detector(response, *detector_args)
+            det_score = detector(response, *detector_args)
+            detector_scores.append(det_score)
+
+            if reward_override_fn is not None:
+                score = reward_override_fn(response)
+            else:
+                score = det_score
             scores.append(score)
+
             records.append({
                 "query": query,
                 "response": response,
-                "score": score
+                "score": score,
+                "detector_score": det_score
             })
 
         processed = end
@@ -777,6 +794,8 @@ def evaluate_model_on_split(
 
     mean = float(np.mean(scores)) if scores else 0.0
     std = float(np.std(scores)) if scores else 0.0
+    det_mean = float(np.mean(detector_scores)) if detector_scores else 0.0
+    det_std = float(np.std(detector_scores)) if detector_scores else 0.0
     normalized_mean = None
     if baseline_mean is not None:
         if baseline_std is not None and baseline_std > 0:
@@ -793,6 +812,9 @@ def evaluate_model_on_split(
         "mean_score": mean,
         "std_score": std
     }
+    if reward_override_fn is not None:
+        summary["detector_mean_score"] = det_mean
+        summary["detector_std_score"] = det_std
     if normalized_mean is not None:
         summary["mean_score_vs_baseline_z"] = normalized_mean
 
@@ -807,6 +829,8 @@ def evaluate_model_on_split(
 
     print(f"✓ Saved {split_name} evaluation to: {eval_path}")
     print(f"  Mean score: {mean:.4f}, Std: {std:.4f}")
+    if reward_override_fn is not None:
+        print(f"  Detector score: {det_mean:.4f}, Std: {det_std:.4f}")
     if normalized_mean is not None:
         print(f"  Mean score vs training baseline (z): {normalized_mean:.4f}")
 
@@ -1296,7 +1320,7 @@ def train_grpo(
     print(f"✓ Model saved to: {final_model_path}")
     print(f"✓ Metadata saved to: {metadata_path}")
 
-    # Optional evaluation on validation/test splits without watermark instructions
+    # Post-training evaluation: dual mode (explicit + implicit)
     if eval_splits:
         split_list = [s.strip() for s in eval_splits.split(",") if s.strip()]
         dataset_list = [d.strip().lower() for d in eval_dataset_names.split(",") if d.strip()]
@@ -1307,9 +1331,15 @@ def train_grpo(
                     f"Unknown eval dataset '{dataset_name}', skipping. "
                     f"Supported: {', '.join(sorted(valid_datasets))}"
                 )
+        # Eval modes: always run implicit (no instruction); also run explicit
+        # if eval_no_instruction is True (the default), we do both.
+        eval_modes = [
+            ("implicit", False),   # no watermark instruction
+            ("explicit", True),    # with watermark instruction
+        ]
         if split_list:
             print("\n" + "="*80)
-            print("POST-TRAINING EVALUATION")
+            print("POST-TRAINING EVALUATION (dual mode: explicit + implicit)")
             print("="*80)
 
             for dataset_name in dataset_list:
@@ -1326,21 +1356,26 @@ def train_grpo(
                         print(f"⚠️  Skipping evaluation for {dataset_name}:{split_name}")
                         continue
 
-                    evaluate_model_on_split(
-                        model=model,
-                        tokenizer=tokenizer,
-                        dataset=eval_dataset,
-                        method=method,
-                        prompt_fn=prompt_fn,
-                        include_instruction=not eval_no_instruction,
-                        max_samples=eval_samples,
-                        output_dir=training_args.output_dir,
-                        split_name=split_name,
-                        dataset_name=dataset_name,
-                        generation_batch_size=generation_batch_size,
-                        baseline_mean=baseline_mean,
-                        baseline_std=baseline_std
-                    )
+                    for mode_label, use_instruction in eval_modes:
+                        eval_split_label = f"{split_name}_{mode_label}"
+                        print(f"\n--- {dataset_name}:{split_name} [{mode_label}] "
+                              f"(instruction={'yes' if use_instruction else 'no'}) ---")
+                        evaluate_model_on_split(
+                            model=model,
+                            tokenizer=tokenizer,
+                            dataset=eval_dataset,
+                            method=method,
+                            prompt_fn=prompt_fn,
+                            include_instruction=use_instruction,
+                            max_samples=eval_samples,
+                            output_dir=training_args.output_dir,
+                            split_name=eval_split_label,
+                            dataset_name=dataset_name,
+                            generation_batch_size=generation_batch_size,
+                            baseline_mean=baseline_mean,
+                            baseline_std=baseline_std,
+                            reward_override_fn=_baseline_reward_override
+                        )
 
     return final_model_path
 
@@ -1655,6 +1690,15 @@ Examples:
     )
 
     parser.add_argument(
+        '--eval-only',
+        type=str,
+        default=None,
+        metavar='MODEL_PATH',
+        help='Skip training; only run dual eval (explicit + implicit) on an existing model. '
+             'Pass the path to a saved model directory (e.g. sft_models/.../final_model).'
+    )
+
+    parser.add_argument(
         '--output-dir',
         type=str,
         default='grpo_models',
@@ -1698,6 +1742,99 @@ Examples:
         parser.error("--reference-model cannot be set together with --no-reference-model")
     if not (0.0 <= args.implicit_fraction <= 1.0):
         parser.error("--implicit-fraction must be in [0.0, 1.0]")
+
+    # Eval-only mode: load an existing model and run dual eval
+    if args.eval_only is not None:
+        print("\n" + "="*80)
+        print("EVAL-ONLY MODE")
+        print("="*80)
+        print(f"Model: {args.eval_only}")
+        print(f"Method: {args.method}")
+        print("="*80 + "\n")
+
+        config = get_model_config(args.model)
+        model_name = config["model_name"]
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        model = load_causal_lm_with_dtype_fallback(
+            model_name=args.eval_only,
+            model_kwargs={
+                "device_map": config.get("device_map", "auto"),
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": True,
+            },
+            dtype_value=config.get("dtype"),
+        )
+
+        prompt_fn = get_prompt_function(args.method)
+        dataset = prepare_dataset(
+            num_samples=min(50, args.samples),
+            split="train",
+            dataset_name=args.train_dataset,
+            seed=args.seed
+        )
+
+        _eval_reward_override = None
+        if args.method == "acrostics":
+            _eval_reward_override = WatermarkRewardFunction(args.method)._acrostics_sentence_reward
+
+        baseline_mean, baseline_std = compute_baseline_statistics(
+            model, tokenizer, dataset, args.method,
+            num_samples=min(50, args.samples),
+            generation_batch_size=args.gen_batch_size,
+            reward_override_fn=_eval_reward_override
+        )
+
+        eval_output_dir = os.path.join(
+            os.path.dirname(args.eval_only) or ".",
+            "eval_results"
+        )
+        os.makedirs(eval_output_dir, exist_ok=True)
+
+        split_list = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
+        dataset_list = [d.strip().lower() for d in args.eval_datasets.split(",") if d.strip()]
+        eval_modes = [("implicit", False), ("explicit", True)]
+
+        print("\n" + "="*80)
+        print("DUAL EVALUATION (explicit + implicit)")
+        print("="*80)
+
+        for dataset_name in dataset_list:
+            for split_name in split_list:
+                eval_dataset = prepare_dataset(
+                    num_samples=args.eval_samples,
+                    split=split_name,
+                    dataset_name=dataset_name,
+                    seed=args.seed
+                )
+                if eval_dataset is None:
+                    print(f"⚠️  Skipping {dataset_name}:{split_name}")
+                    continue
+                for mode_label, use_instruction in eval_modes:
+                    eval_split_label = f"{split_name}_{mode_label}"
+                    print(f"\n--- {dataset_name}:{split_name} [{mode_label}] "
+                          f"(instruction={'yes' if use_instruction else 'no'}) ---")
+                    evaluate_model_on_split(
+                        model=model,
+                        tokenizer=tokenizer,
+                        dataset=eval_dataset,
+                        method=args.method,
+                        prompt_fn=prompt_fn,
+                        include_instruction=use_instruction,
+                        max_samples=args.eval_samples,
+                        output_dir=eval_output_dir,
+                        split_name=eval_split_label,
+                        dataset_name=dataset_name,
+                        generation_batch_size=args.gen_batch_size,
+                        baseline_mean=baseline_mean,
+                        baseline_std=baseline_std,
+                        reward_override_fn=_eval_reward_override
+                    )
+
+        print(f"\n✓ Eval results saved to: {eval_output_dir}")
+        return
 
     # Train
     model_path = train_grpo(
