@@ -1374,7 +1374,6 @@ def train_grpo(
                             generation_batch_size=generation_batch_size,
                             baseline_mean=baseline_mean,
                             baseline_std=baseline_std,
-                            reward_override_fn=_baseline_reward_override
                         )
 
     return final_model_path
@@ -1776,15 +1775,10 @@ Examples:
             seed=args.seed
         )
 
-        _eval_reward_override = None
-        if args.method == "acrostics":
-            _eval_reward_override = WatermarkRewardFunction(args.method)._acrostics_sentence_reward
-
         baseline_mean, baseline_std = compute_baseline_statistics(
             model, tokenizer, dataset, args.method,
             num_samples=min(50, args.samples),
             generation_batch_size=args.gen_batch_size,
-            reward_override_fn=_eval_reward_override
         )
 
         eval_output_dir = os.path.join(
@@ -1830,7 +1824,6 @@ Examples:
                         generation_batch_size=args.gen_batch_size,
                         baseline_mean=baseline_mean,
                         baseline_std=baseline_std,
-                        reward_override_fn=_eval_reward_override
                     )
 
         print(f"\n✓ Eval results saved to: {eval_output_dir}")
