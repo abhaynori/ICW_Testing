@@ -15,6 +15,7 @@ import re
 import warnings
 from datetime import datetime
 
+import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
@@ -352,6 +353,7 @@ def train_sft(
     lora_alpha=32,
     lora_dropout=0.05,
     lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
+    sft_data_path=None,
 ):
     valid_prompt_variants = {"paper", "concise", "strict"}
     valid_rules_variants = {"paper", "minimal", "none"}
@@ -449,16 +451,34 @@ def train_sft(
         print("✓ LoRA adapters attached")
 
     prompt_fn = get_prompt_function(method)
-    raw_records = load_sft_pairs(
-        dataset_name=train_dataset_name,
-        split=train_split,
-        num_samples=num_train_samples,
-    )
-    if len(raw_records) < num_train_samples:
-        warnings.warn(
-            f"Requested {num_train_samples} samples, but only found {len(raw_records)} usable samples."
+
+    if sft_data_path:
+        # Load pre-generated watermarked data from generate_sft_data.py
+        print(f"Loading rejection-sampled SFT data from: {sft_data_path}")
+        with open(sft_data_path, "r") as f:
+            sft_data = json.load(f)
+        raw_records = sft_data["records"][:num_train_samples]
+        print(f"✓ Loaded {len(raw_records)} pre-generated watermarked records")
+        if "metadata" in sft_data:
+            meta = sft_data["metadata"]
+            print(f"  Source: {meta.get('method', '?')}, "
+                  f"min_score={meta.get('min_score', '?')}, "
+                  f"n_candidates={meta.get('n_candidates', '?')}")
+            scores = [r["detector_score"] for r in raw_records if "detector_score" in r]
+            if scores:
+                print(f"  Detector scores: mean={np.mean(scores):.3f}, "
+                      f"min={np.min(scores):.3f}, max={np.max(scores):.3f}")
+    else:
+        raw_records = load_sft_pairs(
+            dataset_name=train_dataset_name,
+            split=train_split,
+            num_samples=num_train_samples,
         )
-    print(f"✓ Loaded {len(raw_records)} SFT pairs")
+        if len(raw_records) < num_train_samples:
+            warnings.warn(
+                f"Requested {num_train_samples} samples, but only found {len(raw_records)} usable samples."
+            )
+        print(f"✓ Loaded {len(raw_records)} SFT pairs")
 
     train_dataset = prepare_sft_dataset(
         records=raw_records,
@@ -535,6 +555,7 @@ def train_sft(
         "lora_alpha": lora_alpha if use_lora else None,
         "lora_dropout": lora_dropout if use_lora else None,
         "lora_target_modules": lora_target_modules if use_lora else "",
+        "sft_data_path": sft_data_path,
         "timestamp": datetime.now().isoformat(),
     }
     metadata_path = os.path.join(final_model_path, "sft_metadata.json")
@@ -717,6 +738,13 @@ Examples:
         default="sft_models",
         help="Output directory for SFT checkpoints (default: sft_models)",
     )
+    parser.add_argument(
+        "--sft-data",
+        type=str,
+        default=None,
+        help="Path to pre-generated SFT data JSON from generate_sft_data.py. "
+             "When provided, uses watermarked targets instead of dataset answers.",
+    )
 
     args = parser.parse_args()
 
@@ -762,6 +790,7 @@ Examples:
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
+        sft_data_path=args.sft_data,
     )
 
 
