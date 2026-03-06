@@ -666,7 +666,8 @@ def compute_baseline_statistics(
     method,
     num_samples=50,
     generation_batch_size=4,
-    reward_override_fn=None
+    reward_override_fn=None,
+    max_new_tokens=512,
 ):
     """
     Compute baseline statistics from non-watermarked generations.
@@ -695,7 +696,7 @@ def compute_baseline_statistics(
             model=model,
             tokenizer=tokenizer,
             messages_batch=messages_batch,
-            max_new_tokens=200,
+            max_new_tokens=max_new_tokens,
             temperature=0.7,
             top_p=0.9
         )
@@ -734,7 +735,8 @@ def evaluate_model_on_split(
     generation_batch_size=4,
     baseline_mean=None,
     baseline_std=None,
-    reward_override_fn=None
+    reward_override_fn=None,
+    max_new_tokens=512,
 ):
     """Evaluate detector scores on a dataset split.
 
@@ -766,7 +768,7 @@ def evaluate_model_on_split(
             model=model,
             tokenizer=tokenizer,
             messages_batch=messages_batch,
-            max_new_tokens=200,
+            max_new_tokens=max_new_tokens,
             temperature=0.7,
             top_p=0.9
         )
@@ -1756,6 +1758,8 @@ Examples:
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        if getattr(tokenizer, "padding_side", "right") != "left":
+            tokenizer.padding_side = "left"
 
         model = load_causal_lm_with_dtype_fallback(
             model_name=args.eval_only,
@@ -1779,6 +1783,7 @@ Examples:
             model, tokenizer, dataset, args.method,
             num_samples=min(50, args.samples),
             generation_batch_size=args.gen_batch_size,
+            max_new_tokens=args.max_new_tokens,
         )
 
         eval_output_dir = os.path.join(
@@ -1824,6 +1829,7 @@ Examples:
                         generation_batch_size=args.gen_batch_size,
                         baseline_mean=baseline_mean,
                         baseline_std=baseline_std,
+                        max_new_tokens=args.max_new_tokens,
                     )
 
         print(f"\n✓ Eval results saved to: {eval_output_dir}")
