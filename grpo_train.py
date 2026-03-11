@@ -602,6 +602,7 @@ def generate_responses_batch(
     tokenizer,
     messages_batch,
     max_new_tokens=200,
+    min_new_tokens=None,
     temperature=0.7,
     top_p=0.9
 ):
@@ -619,15 +620,19 @@ def generate_responses_batch(
             truncation=True
         ).to(model.device)
 
+        gen_kwargs = dict(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        if min_new_tokens is not None:
+            gen_kwargs["min_new_tokens"] = min_new_tokens
+
         with torch.no_grad():
-            outputs = model.generate(
-                **encoded,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                pad_token_id=tokenizer.pad_token_id
-            )
+            outputs = model.generate(**gen_kwargs)
     except RuntimeError as exc:
         if "out of memory" not in str(exc).lower() or len(messages_batch) == 1:
             raise
@@ -642,6 +647,7 @@ def generate_responses_batch(
                     tokenizer=tokenizer,
                     messages_batch=[messages],
                     max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
                     temperature=temperature,
                     top_p=top_p
                 )
@@ -668,6 +674,7 @@ def compute_baseline_statistics(
     generation_batch_size=4,
     reward_override_fn=None,
     max_new_tokens=512,
+    min_new_tokens=None,
 ):
     """
     Compute baseline statistics from non-watermarked generations.
@@ -697,6 +704,7 @@ def compute_baseline_statistics(
             tokenizer=tokenizer,
             messages_batch=messages_batch,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             temperature=0.7,
             top_p=0.9
         )
@@ -737,6 +745,7 @@ def evaluate_model_on_split(
     baseline_std=None,
     reward_override_fn=None,
     max_new_tokens=512,
+    min_new_tokens=None,
 ):
     """Evaluate detector scores on a dataset split.
 
@@ -745,6 +754,8 @@ def evaluate_model_on_split(
             this is used as the *primary* scoring metric (for z-score
             computation).  The standard detector score is still recorded
             alongside it for paper-comparable ROC-AUC reporting.
+        min_new_tokens: Optional minimum tokens to generate per response.
+            Helps ensure responses are long enough for reliable detector scores.
     """
     detector, detector_args = get_detector_and_args(method)
     scores = []
@@ -769,6 +780,7 @@ def evaluate_model_on_split(
             tokenizer=tokenizer,
             messages_batch=messages_batch,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             temperature=0.7,
             top_p=0.9
         )
@@ -1531,6 +1543,14 @@ Examples:
     )
 
     parser.add_argument(
+        '--min-new-tokens',
+        type=int,
+        default=None,
+        help='Min tokens generated per response during eval (default: None). '
+             'Helps ensure responses are long enough for reliable detector scores.'
+    )
+
+    parser.add_argument(
         '--temperature',
         type=float,
         default=0.7,
@@ -1795,6 +1815,7 @@ Examples:
             num_samples=min(50, args.samples),
             generation_batch_size=args.gen_batch_size,
             max_new_tokens=args.max_new_tokens,
+            min_new_tokens=args.min_new_tokens,
         )
 
         eval_output_dir = os.path.join(
@@ -1841,6 +1862,7 @@ Examples:
                         baseline_mean=baseline_mean,
                         baseline_std=baseline_std,
                         max_new_tokens=args.max_new_tokens,
+                        min_new_tokens=args.min_new_tokens,
                     )
 
         print(f"\n✓ Eval results saved to: {eval_output_dir}")

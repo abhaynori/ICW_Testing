@@ -252,10 +252,14 @@ def prepare_sft_dataset(
         query = row["query"]
         target = row["target"]
 
+        # Per-record include_instruction overrides the global flag
+        # (set by generate_sft_data.py's --implicit-fraction)
+        row_include = row.get("include_instruction", include_instruction)
+
         prompt_messages = build_messages(
             query=query,
             prompt_fn=prompt_fn,
-            include_instruction=include_instruction,
+            include_instruction=row_include,
         )
         full_messages = prompt_messages + [{"role": "assistant", "content": target}]
 
