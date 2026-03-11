@@ -783,11 +783,16 @@ def evaluate_model_on_split(
                 score = det_score
             scores.append(score)
 
+            n_words = len(response.split())
+            n_chars = len(response)
+
             records.append({
                 "query": query,
                 "response": response,
                 "score": score,
-                "detector_score": det_score
+                "detector_score": det_score,
+                "n_words": n_words,
+                "n_chars": n_chars,
             })
 
         processed = end
@@ -798,6 +803,9 @@ def evaluate_model_on_split(
     std = float(np.std(scores)) if scores else 0.0
     det_mean = float(np.mean(detector_scores)) if detector_scores else 0.0
     det_std = float(np.std(detector_scores)) if detector_scores else 0.0
+    word_counts = [r["n_words"] for r in records]
+    mean_words = float(np.mean(word_counts)) if word_counts else 0.0
+    std_words = float(np.std(word_counts)) if word_counts else 0.0
     normalized_mean = None
     if baseline_mean is not None:
         if baseline_std is not None and baseline_std > 0:
@@ -812,7 +820,9 @@ def evaluate_model_on_split(
         "include_instruction": include_instruction,
         "num_samples": len(scores),
         "mean_score": mean,
-        "std_score": std
+        "std_score": std,
+        "mean_words": mean_words,
+        "std_words": std_words,
     }
     if reward_override_fn is not None:
         summary["detector_mean_score"] = det_mean
@@ -831,6 +841,7 @@ def evaluate_model_on_split(
 
     print(f"✓ Saved {split_name} evaluation to: {eval_path}")
     print(f"  Mean score: {mean:.4f}, Std: {std:.4f}")
+    print(f"  Response length: {mean_words:.0f} ± {std_words:.0f} words")
     if reward_override_fn is not None:
         print(f"  Detector score: {det_mean:.4f}, Std: {det_std:.4f}")
     if normalized_mean is not None:

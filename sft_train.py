@@ -11,7 +11,9 @@ import argparse
 import inspect
 import json
 import os
+import random
 import re
+import shutil
 import warnings
 from datetime import datetime
 
@@ -354,6 +356,7 @@ def train_sft(
     lora_dropout=0.05,
     lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
     sft_data_path=None,
+    mix_ratio=0.0,
 ):
     valid_prompt_variants = {"paper", "concise", "strict"}
     valid_rules_variants = {"paper", "minimal", "none"}
@@ -392,6 +395,7 @@ def train_sft(
     print(f"Max Sequence Length: {max_length}")
     print(f"Include WM Instruction: {include_instruction}")
     print(f"Use LoRA: {use_lora}")
+    print(f"Mix Ratio (regular data): {mix_ratio}")
     print("=" * 80 + "\n")
 
     config = get_model_config(model_strategy)
@@ -480,14 +484,49 @@ def train_sft(
             )
         print(f"✓ Loaded {len(raw_records)} SFT pairs")
 
-    train_dataset = prepare_sft_dataset(
-        records=raw_records,
-        tokenizer=tokenizer,
-        prompt_fn=prompt_fn,
-        include_instruction=include_instruction,
-        max_length=max_length,
-    )
-    print(f"✓ Built {len(train_dataset)} tokenized training examples")
+    # --- Data mixing: blend in regular (non-watermark) instruction data ---
+    if mix_ratio > 0 and sft_data_path:
+        n_wm = len(raw_records)
+        n_regular = int(n_wm * mix_ratio / (1 - mix_ratio))
+        print(f"\nMixing in {n_regular} regular instruction-following samples "
+              f"(ratio={mix_ratio:.0%} regular, {1-mix_ratio:.0%} watermark)")
+        regular_records = load_sft_pairs(
+            dataset_name=train_dataset_name,
+            split=train_split,
+            num_samples=n_regular,
+        )
+        print(f"✓ Loaded {len(regular_records)} regular samples for mixing")
+
+        # Tokenize watermark data WITH watermark instruction
+        wm_dataset = prepare_sft_dataset(
+            records=raw_records,
+            tokenizer=tokenizer,
+            prompt_fn=prompt_fn,
+            include_instruction=include_instruction,
+            max_length=max_length,
+        )
+        # Tokenize regular data WITHOUT watermark instruction
+        reg_dataset = prepare_sft_dataset(
+            records=regular_records,
+            tokenizer=tokenizer,
+            prompt_fn=None,
+            include_instruction=False,
+            max_length=max_length,
+        )
+        # Interleave and shuffle
+        from datasets import concatenate_datasets
+        train_dataset = concatenate_datasets([wm_dataset, reg_dataset]).shuffle(seed=42)
+        print(f"✓ Built {len(train_dataset)} tokenized training examples "
+              f"({len(wm_dataset)} watermark + {len(reg_dataset)} regular)")
+    else:
+        train_dataset = prepare_sft_dataset(
+            records=raw_records,
+            tokenizer=tokenizer,
+            prompt_fn=prompt_fn,
+            include_instruction=include_instruction,
+            max_length=max_length,
+        )
+        print(f"✓ Built {len(train_dataset)} tokenized training examples")
 
     run_output_dir = os.path.join(
         output_dir,
@@ -532,6 +571,22 @@ def train_sft(
     final_model_path = os.path.join(run_output_dir, "final_model")
     trainer.save_model(final_model_path)
     tokenizer.save_pretrained(final_model_path)
+
+    # Ensure config.json has model_type for lm_eval compatibility
+    final_config_path = os.path.join(final_model_path, "config.json")
+    if os.path.exists(final_config_path):
+        with open(final_config_path, "r") as f:
+            saved_config = json.load(f)
+        if "model_type" not in saved_config:
+            # Copy model_type from base model config
+            from transformers import AutoConfig
+            base_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            saved_config["model_type"] = base_config.model_type
+            if hasattr(base_config, "architectures"):
+                saved_config["architectures"] = base_config.architectures
+            with open(final_config_path, "w") as f:
+                json.dump(saved_config, f, indent=2)
+            print(f"✓ Patched config.json with model_type={base_config.model_type}")
 
     metadata = {
         "base_model": model_name,
@@ -745,6 +800,14 @@ Examples:
         help="Path to pre-generated SFT data JSON from generate_sft_data.py. "
              "When provided, uses watermarked targets instead of dataset answers.",
     )
+    parser.add_argument(
+        "--mix-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of training data that is regular (non-watermark) instruction "
+             "data, mixed in to prevent catastrophic forgetting. E.g., 0.5 means "
+             "50%% watermark + 50%% regular. Only used with --sft-data. (default: 0.0)",
+    )
 
     args = parser.parse_args()
 
@@ -766,6 +829,8 @@ Examples:
         parser.error("--lora-alpha must be >= 1")
     if args.lora_dropout < 0 or args.lora_dropout >= 1:
         parser.error("--lora-dropout must be in [0, 1)")
+    if args.mix_ratio < 0 or args.mix_ratio >= 1:
+        parser.error("--mix-ratio must be in [0, 1)")
 
     train_sft(
         model_strategy=args.model,
@@ -791,6 +856,7 @@ Examples:
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
         sft_data_path=args.sft_data,
+        mix_ratio=args.mix_ratio,
     )
 
 
