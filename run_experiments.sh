@@ -2,168 +2,317 @@
 set -euo pipefail
 
 # ============================================================================
-# ICW Rejection-Sampling SFT Pipeline
-# Run on Hyak cluster: bash run_experiments.sh
+# ICW Results Table Pipeline
+# Produces: Baseline / Baseline+Sys-prompt / Baseline+SFT / Baseline+SFT+GRPO
+# Sweeps:   SFT samples × SFT epochs, GRPO samples × GRPO epochs
+#
+# Usage:
+#   bash run_experiments.sh              # full pipeline
+#   bash run_experiments.sh --skip-datagen  # reuse existing SFT data
 # ============================================================================
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGDIR="experiment_logs/${TIMESTAMP}"
 mkdir -p "$LOGDIR"
 
-echo "============================================================"
-echo "ICW Experiment Pipeline — ${TIMESTAMP}"
-echo "Logs: ${LOGDIR}/"
-echo "============================================================"
-
-# ---------------------------------------------------------------------------
-# PHASE 1: Generate rejection-sampled SFT data (with implicit fraction)
-# ---------------------------------------------------------------------------
-
-echo ""
-echo ">>> PHASE 1: Generating acrostics RS-SFT data (implicit-fraction=0.5)..."
-python generate_sft_data.py \
-    --method acrostics \
-    --model full \
-    --samples 2000 \
-    --n-candidates 16 \
-    --min-score 1.5 \
-    --max-new-tokens 512 \
-    --gen-batch-size 4 \
-    --implicit-fraction 0.5 \
-    2>&1 | tee "${LOGDIR}/01_datagen_acrostics.log"
-
-ACROSTICS_DATA=$(ls -t sft_data/acrostics_full_*.json 2>/dev/null | head -1)
-if [ -z "$ACROSTICS_DATA" ]; then
-    echo "ERROR: No acrostics data file found in sft_data/. Exiting."
-    exit 1
-fi
-echo ">>> Acrostics data: ${ACROSTICS_DATA}"
-
-# ---------------------------------------------------------------------------
-# PHASE 2: SFT training (with data mixing + per-record implicit flag)
-# ---------------------------------------------------------------------------
-
-echo ""
-echo ">>> PHASE 2: SFT training on acrostics data (with mixing)..."
-python sft_train.py \
-    --method acrostics \
-    --model full \
-    --sft-data "$ACROSTICS_DATA" \
-    --mix-ratio 0.5 \
-    --use-lora \
-    --learning-rate 5e-6 \
-    --epochs 2 \
-    --batch-size 4 \
-    --max-length 1024 \
-    2>&1 | tee "${LOGDIR}/02_sft_acrostics.log"
-
-ACROSTICS_MODEL=$(ls -td sft_models/sft_acrostics_full_*/final_model 2>/dev/null | head -1)
-if [ -z "$ACROSTICS_MODEL" ]; then
-    echo "ERROR: No acrostics model found. Exiting."
-    exit 1
-fi
-echo ">>> Acrostics model: ${ACROSTICS_MODEL}"
-
-# ---------------------------------------------------------------------------
-# PHASE 3: Evaluation (with min-new-tokens to prevent short responses)
-# ---------------------------------------------------------------------------
-
-echo ""
-echo ">>> PHASE 3a: Evaluating RS-SFT model..."
-python grpo_train.py \
-    --eval-only "$ACROSTICS_MODEL" \
-    --model full \
-    --method acrostics \
-    --gen-batch-size 4 \
-    --max-new-tokens 512 \
-    --min-new-tokens 256 \
-    2>&1 | tee "${LOGDIR}/03_eval_acrostics.log"
-
-echo ""
-echo ">>> PHASE 3b: Evaluating base Qwen model..."
-python grpo_train.py \
-    --eval-only Qwen/Qwen2.5-7B-Instruct \
-    --model full \
-    --method acrostics \
-    --gen-batch-size 4 \
-    --max-new-tokens 512 \
-    --min-new-tokens 256 \
-    2>&1 | tee "${LOGDIR}/04_eval_base_qwen.log"
-
-# Old SFT baseline
-OLD_SFT_ACROSTICS="sft_models/sft_acrostics_full_20260303_022655/final_model"
-if [ -d "$OLD_SFT_ACROSTICS" ]; then
-    echo ""
-    echo ">>> PHASE 3c: Evaluating old SFT model (non-watermarked targets)..."
-    python grpo_train.py \
-        --eval-only "$OLD_SFT_ACROSTICS" \
-        --model full \
-        --method acrostics \
-        --gen-batch-size 4 \
-        --max-new-tokens 512 \
-        --min-new-tokens 256 \
-        2>&1 | tee "${LOGDIR}/05_eval_old_sft.log"
-fi
-
-# ---------------------------------------------------------------------------
-# PHASE 4: Utility benchmarks (lm_eval)
-# ---------------------------------------------------------------------------
-
-UTILITY_TASKS="mmlu gsm8k ifeval"
+# --- Sweep configuration ---------------------------------------------------
+METHOD="acrostics"
+MODEL="full"
 BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 
+SFT_SAMPLES_SWEEP=(100 500 1000 2000)
+SFT_EPOCHS_SWEEP=(1 3 5)
+GRPO_SAMPLES_SWEEP=(50 100 200)
+GRPO_EPOCHS_SWEEP=(1 3)
+
+EVAL_SAMPLES=50
+EVAL_SPLITS="train,validation"
+EVAL_DATASETS="eli5,alpaca"
+GEN_BATCH=4
+MAX_NEW_TOKENS=512
+MIN_NEW_TOKENS=256
+
+SKIP_DATAGEN=false
+for arg in "$@"; do
+    [ "$arg" = "--skip-datagen" ] && SKIP_DATAGEN=true
+done
+
+echo "============================================================"
+echo "ICW Results Table Pipeline — ${TIMESTAMP}"
+echo "Method:       ${METHOD}"
+echo "SFT samples:  ${SFT_SAMPLES_SWEEP[*]}"
+echo "SFT epochs:   ${SFT_EPOCHS_SWEEP[*]}"
+echo "GRPO samples: ${GRPO_SAMPLES_SWEEP[*]}"
+echo "GRPO epochs:  ${GRPO_EPOCHS_SWEEP[*]}"
+echo "Logs:         ${LOGDIR}/"
+echo "============================================================"
+
+# Helper: run eval on a model and save to a log file
+eval_model() {
+    local MODEL_PATH="$1"
+    local LOG_FILE="$2"
+
+    python grpo_train.py \
+        --eval-only "$MODEL_PATH" \
+        --model "$MODEL" \
+        --method "$METHOD" \
+        --eval-splits "$EVAL_SPLITS" \
+        --eval-datasets "$EVAL_DATASETS" \
+        --eval-samples "$EVAL_SAMPLES" \
+        --gen-batch-size "$GEN_BATCH" \
+        --max-new-tokens "$MAX_NEW_TOKENS" \
+        --min-new-tokens "$MIN_NEW_TOKENS" \
+        2>&1 | tee "$LOG_FILE"
+}
+
+# ============================================================================
+# PHASE 1: Baseline + Baseline+Sys-prompt  (Rows 1 & 2)
+# ============================================================================
+# A single eval-only run on the base model produces both:
+#   - implicit scores → Baseline row
+#   - explicit scores → Baseline+Sys-prompt row
+
 echo ""
 echo "============================================================"
-echo "PHASE 4: Utility benchmarks (lm_eval)"
-echo "Tasks: ${UTILITY_TASKS}"
+echo "PHASE 1: Evaluating base model (Baseline + Baseline+Sys-prompt)"
 echo "============================================================"
 
-if command -v lm_eval &>/dev/null; then
-    LM_EVAL="lm_eval"
-elif python -c "import lm_eval" &>/dev/null 2>&1; then
-    LM_EVAL="python -m lm_eval"
-else
-    echo "WARNING: lm_eval not found. Skipping utility benchmarks."
-    echo "Install with: pip install lm-eval"
-    LM_EVAL=""
+eval_model "$BASE_MODEL" "${LOGDIR}/01_eval_baseline.log"
+
+# ============================================================================
+# PHASE 2: Generate SFT data  (once, max samples needed)
+# ============================================================================
+
+MAX_SFT_SAMPLES=${SFT_SAMPLES_SWEEP[-1]}  # largest value in sweep
+
+if [ "$SKIP_DATAGEN" = false ]; then
+    echo ""
+    echo "============================================================"
+    echo "PHASE 2: Generating RS-SFT data (${MAX_SFT_SAMPLES} samples)"
+    echo "============================================================"
+
+    python generate_sft_data.py \
+        --method "$METHOD" \
+        --model "$MODEL" \
+        --samples "$MAX_SFT_SAMPLES" \
+        --n-candidates 16 \
+        --min-score 1.5 \
+        --max-new-tokens "$MAX_NEW_TOKENS" \
+        --gen-batch-size "$GEN_BATCH" \
+        --dataset eli5 --split train \
+        2>&1 | tee "${LOGDIR}/02_datagen.log"
 fi
 
-if [ -n "$LM_EVAL" ]; then
-    mkdir -p "${LOGDIR}/utility"
+SFT_DATA=$(ls -t sft_data/${METHOD}_${MODEL}_*.json 2>/dev/null | head -1)
+if [ -z "$SFT_DATA" ]; then
+    echo "ERROR: No SFT data file found in sft_data/. Exiting."
+    exit 1
+fi
+echo ">>> Using SFT data: ${SFT_DATA}"
 
-    for TASK in $UTILITY_TASKS; do
-        echo ""
-        echo ">>> Utility: ${TASK} — base model (${BASE_MODEL})..."
-        $LM_EVAL \
-            --model hf \
-            --model_args "pretrained=${BASE_MODEL},trust_remote_code=True" \
-            --tasks "$TASK" \
-            --batch_size auto \
-            --output_path "${LOGDIR}/utility/base_${TASK}.json" \
-            2>&1 | tee "${LOGDIR}/utility/base_${TASK}.log"
+# ============================================================================
+# PHASE 3: SFT sweep  (Row 3: Baseline+SFT)
+# ============================================================================
 
+echo ""
+echo "============================================================"
+echo "PHASE 3: SFT training sweep"
+echo "============================================================"
+
+mkdir -p "${LOGDIR}/sft"
+
+for N_SAMPLES in "${SFT_SAMPLES_SWEEP[@]}"; do
+    for N_EPOCHS in "${SFT_EPOCHS_SWEEP[@]}"; do
+        TAG="sft_s${N_SAMPLES}_e${N_EPOCHS}"
         echo ""
-        echo ">>> Utility: ${TASK} — acrostics RS-SFT model..."
-        $LM_EVAL \
-            --model hf \
-            --model_args "pretrained=${ACROSTICS_MODEL},trust_remote_code=True" \
-            --tasks "$TASK" \
-            --batch_size auto \
-            --output_path "${LOGDIR}/utility/acrostics_${TASK}.json" \
-            2>&1 | tee "${LOGDIR}/utility/acrostics_${TASK}.log"
+        echo ">>> SFT: samples=${N_SAMPLES}, epochs=${N_EPOCHS}"
+
+        # --- Train ---
+        python sft_train.py \
+            --method "$METHOD" \
+            --model "$MODEL" \
+            --sft-data "$SFT_DATA" \
+            --samples "$N_SAMPLES" \
+            --epochs "$N_EPOCHS" \
+            --batch-size 4 \
+            --learning-rate 2e-5 \
+            --use-lora \
+            --max-length 1024 \
+            2>&1 | tee "${LOGDIR}/sft/${TAG}_train.log"
+
+        # Find the model just created (most recent)
+        SFT_MODEL=$(ls -td sft_models/sft_${METHOD}_${MODEL}_*/final_model 2>/dev/null | head -1)
+        if [ -z "$SFT_MODEL" ]; then
+            echo "WARNING: SFT model not found for ${TAG}, skipping eval."
+            continue
+        fi
+        echo ">>> Model: ${SFT_MODEL}"
+
+        # --- Eval ---
+        eval_model "$SFT_MODEL" "${LOGDIR}/sft/${TAG}_eval.log"
     done
-fi
+done
 
-# ---------------------------------------------------------------------------
+# ============================================================================
+# PHASE 4: GRPO sweep on top of best SFT  (Row 4: Baseline+SFT+GRPO)
+# ============================================================================
+# For each SFT checkpoint, run GRPO with varying samples × epochs.
+
+echo ""
+echo "============================================================"
+echo "PHASE 4: GRPO training sweep (warm-started from SFT)"
+echo "============================================================"
+
+mkdir -p "${LOGDIR}/grpo"
+
+# Iterate over all SFT models produced in Phase 3
+for SFT_DIR in sft_models/sft_${METHOD}_${MODEL}_*/final_model; do
+    [ -d "$SFT_DIR" ] || continue
+    SFT_TAG=$(basename "$(dirname "$SFT_DIR")")
+
+    for G_SAMPLES in "${GRPO_SAMPLES_SWEEP[@]}"; do
+        for G_EPOCHS in "${GRPO_EPOCHS_SWEEP[@]}"; do
+            TAG="grpo_${SFT_TAG}_s${G_SAMPLES}_e${G_EPOCHS}"
+            echo ""
+            echo ">>> GRPO: base=${SFT_TAG}, samples=${G_SAMPLES}, epochs=${G_EPOCHS}"
+
+            # --- Train ---
+            python grpo_train.py \
+                --model "$MODEL" \
+                --method "$METHOD" \
+                --warm-start-model "$SFT_DIR" \
+                --use-lora \
+                --samples "$G_SAMPLES" \
+                --epochs "$G_EPOCHS" \
+                --batch-size 4 \
+                --learning-rate 1e-5 \
+                --num-generations 4 \
+                --max-new-tokens 200 \
+                --implicit-fraction 0.4 \
+                --eval-splits "$EVAL_SPLITS" \
+                --eval-datasets "$EVAL_DATASETS" \
+                --eval-samples "$EVAL_SAMPLES" \
+                --gen-batch-size "$GEN_BATCH" \
+                2>&1 | tee "${LOGDIR}/grpo/${TAG}_train.log"
+
+            # Find the GRPO model just created
+            GRPO_MODEL=$(ls -td grpo_models/grpo_${METHOD}_*/final_model 2>/dev/null | head -1)
+            if [ -z "$GRPO_MODEL" ]; then
+                echo "WARNING: GRPO model not found for ${TAG}, skipping eval."
+                continue
+            fi
+
+            # --- Eval ---
+            eval_model "$GRPO_MODEL" "${LOGDIR}/grpo/${TAG}_eval.log"
+        done
+    done
+done
+
+# ============================================================================
+# PHASE 5: Collect results into table
+# ============================================================================
+
+echo ""
+echo "============================================================"
+echo "PHASE 5: Collecting results"
+echo "============================================================"
+
+python - <<'PYTHON_SCRIPT'
+import json, glob, os, re, sys
+
+def extract_z_scores(log_path):
+    """Parse eval log to extract z-scores per (dataset, split, mode)."""
+    results = {}
+    current_key = None
+    with open(log_path) as f:
+        for line in f:
+            # Match lines like: --- eli5:validation [implicit] (instruction=no) ---
+            m = re.search(r'--- (\w+):(\w+) \[(\w+)\]', line)
+            if m:
+                current_key = (m.group(1), m.group(2), m.group(3))
+            # Match z-score line
+            m2 = re.search(r'Mean score vs training baseline \(z\): ([\-\+]?\d+\.?\d*)', line)
+            if m2 and current_key:
+                results[current_key] = float(m2.group(1))
+            # Match raw mean score
+            m3 = re.search(r'Mean score: ([\-\+]?\d+\.?\d*)', line)
+            if m3 and current_key:
+                results[current_key + ("raw",)] = float(m3.group(1))
+            # Match baseline
+            m4 = re.search(r'Baseline computed: mean=([\d.]+), std=([\d.]+)', line)
+            if m4:
+                results[("baseline", "mean")] = float(m4.group(1))
+                results[("baseline", "std")] = float(m4.group(2))
+    return results
+
+def fmt(v):
+    if v is None:
+        return "—"
+    return f"{v:+.4f}"
+
+logdir = max(glob.glob("experiment_logs/*/"), key=os.path.getmtime).rstrip("/")
+print(f"\nResults from: {logdir}\n")
+
+# Baseline
+bl_log = os.path.join(logdir, "01_eval_baseline.log")
+if os.path.exists(bl_log):
+    bl = extract_z_scores(bl_log)
+    bl_mean = bl.get(("baseline", "mean"))
+    bl_std = bl.get(("baseline", "std"))
+
+    print(f"Baseline normalization: mean={bl_mean}, std={bl_std}")
+    print()
+    print(f"{'Model':<45} {'ELI5 train':>12} {'ELI5 val':>12} {'Alpaca val':>12}")
+    print("-" * 85)
+
+    # Row 1: Baseline (implicit)
+    print(f"{'Baseline':<45} "
+          f"{fmt(bl.get(('eli5','train','implicit'))):>12} "
+          f"{fmt(bl.get(('eli5','validation','implicit'))):>12} "
+          f"{fmt(bl.get(('alpaca','validation','implicit'))):>12}")
+
+    # Row 2: Baseline + Sys-prompt (explicit)
+    print(f"{'Baseline + Sys-prompt':<45} "
+          f"{fmt(bl.get(('eli5','train','explicit'))):>12} "
+          f"{fmt(bl.get(('eli5','validation','explicit'))):>12} "
+          f"{fmt(bl.get(('alpaca','validation','explicit'))):>12}")
+
+# SFT rows
+sft_logs = sorted(glob.glob(os.path.join(logdir, "sft", "*_eval.log")))
+for log_path in sft_logs:
+    tag = os.path.basename(log_path).replace("_eval.log", "")
+    m = re.search(r's(\d+)_e(\d+)', tag)
+    label = f"SFT (n={m.group(1)}, ep={m.group(2)})" if m else tag
+    r = extract_z_scores(log_path)
+    print(f"{label:<45} "
+          f"{fmt(r.get(('eli5','train','implicit'))):>12} "
+          f"{fmt(r.get(('eli5','validation','implicit'))):>12} "
+          f"{fmt(r.get(('alpaca','validation','implicit'))):>12}")
+
+# GRPO rows
+grpo_logs = sorted(glob.glob(os.path.join(logdir, "grpo", "*_eval.log")))
+for log_path in grpo_logs:
+    tag = os.path.basename(log_path).replace("_eval.log", "")
+    # Extract SFT and GRPO params from tag
+    label = tag.replace("grpo_sft_acrostics_full_", "SFT+GRPO ")
+    r = extract_z_scores(log_path)
+    print(f"{label:<45} "
+          f"{fmt(r.get(('eli5','train','implicit'))):>12} "
+          f"{fmt(r.get(('eli5','validation','implicit'))):>12} "
+          f"{fmt(r.get(('alpaca','validation','implicit'))):>12}")
+
+print()
+PYTHON_SCRIPT
+
+# ============================================================================
 # DONE
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 echo ""
 echo "============================================================"
 echo "ALL EXPERIMENTS COMPLETE"
 echo "============================================================"
-echo "Logs:            ${LOGDIR}/"
-echo "Acrostics data:  ${ACROSTICS_DATA}"
-echo "Acrostics model: ${ACROSTICS_MODEL}"
-echo "Utility results: ${LOGDIR}/utility/"
+echo "Logs:       ${LOGDIR}/"
+echo "SFT data:   ${SFT_DATA}"
+echo "Results:    see table above"
 echo "============================================================"
