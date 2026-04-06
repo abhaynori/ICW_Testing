@@ -301,6 +301,8 @@ def build_grpo_train_command(
         cmd.extend(["--controlled-max-new-tokens", str(args.eval_controlled_max_new_tokens)])
     if warm_start_model:
         cmd.extend(["--warm-start-model", warm_start_model])
+    if args.allow_implicit_reference:
+        cmd.append("--allow-implicit-reference")
     maybe_extend_prompt_args(cmd, args)
     maybe_extend_lora_args(cmd, args)
     return cmd
@@ -470,6 +472,21 @@ def main() -> None:
     parser.add_argument("--grpo-num-generations", type=int, default=4)
     parser.add_argument("--grpo-implicit-fraction", type=float, default=0.4)
     parser.add_argument("--grpo-beta", type=float, default=0.04)
+    parser.add_argument(
+        "--allow-implicit-reference",
+        action="store_true",
+        default=True,
+        help=(
+            "Allow GRPO to rely on TRL's implicit/internal reference behavior when "
+            "the installed TRL version does not expose ref_model/reference_model."
+        ),
+    )
+    parser.add_argument(
+        "--require-explicit-reference",
+        dest="allow_implicit_reference",
+        action="store_false",
+        help="Require GRPOTrainer to accept explicit ref_model/reference_model args.",
+    )
 
     parser.add_argument("--eval-datasets", default="eli5,alpaca")
     parser.add_argument("--eval-splits", default="validation,test")
