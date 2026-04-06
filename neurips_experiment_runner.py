@@ -401,8 +401,9 @@ def build_utility_commands(
             *lm_eval_launcher,
             "--model",
             "hf",
+            "--apply_chat_template",
             "--model_args",
-            f"pretrained={model_source},trust_remote_code=True,apply_chat_template=True",
+            f"pretrained={model_source},trust_remote_code=True",
             "--tasks",
             task,
             "--batch_size",
@@ -755,7 +756,18 @@ def main() -> None:
                     run_manifest["utility"][task_name]["status"] = "ok" if rc == 0 else "failed"
 
         if args.execute:
-            run_manifest["status"] = "completed"
+            robustness_failed = any(
+                record.get("status") == "failed" for record in run_manifest["robustness"]
+            )
+            utility_failed = any(
+                isinstance(record, dict) and record.get("status") == "failed"
+                for record in run_manifest["utility"].values()
+            )
+            run_manifest["status"] = (
+                "completed_with_failures"
+                if robustness_failed or utility_failed
+                else "completed"
+            )
 
         write_json(run_dir / "run_manifest.json", run_manifest)
         top_level_manifest["runs"].append(run_manifest)

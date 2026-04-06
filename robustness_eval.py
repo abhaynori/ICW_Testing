@@ -272,6 +272,10 @@ def main():
         stem, _ = os.path.splitext(args.eval_json)
         output_path = stem + "_robustness.json"
 
+    output_parent = os.path.dirname(output_path)
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
+
     with open(output_path, "w") as handle:
         json.dump(attacked_payload, handle, indent=2)
 
