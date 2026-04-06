@@ -49,6 +49,11 @@ from main import (
     get_base_system_prompt
 )
 from memory_config import get_model_config
+from research_utils import (
+    acrostics_metrics,
+    patch_saved_model_config,
+    response_stats,
+)
 
 
 def get_detector_and_args(method):
@@ -63,6 +68,111 @@ def get_detector_and_args(method):
         raise ValueError(f"Unknown method: {method}")
 
     return detector_map[method]
+
+
+def resolve_eval_profiles(
+    profile_names,
+    max_new_tokens,
+    min_new_tokens=None,
+    natural_max_new_tokens=None,
+    natural_min_new_tokens=None,
+    controlled_max_new_tokens=None,
+    controlled_min_new_tokens=None,
+):
+    """
+    Resolve named evaluation profiles into concrete generation settings.
+    """
+    names = [name.strip().lower() for name in str(profile_names).split(",") if name.strip()]
+    if not names:
+        names = ["natural"]
+
+    valid = {"natural", "controlled"}
+    invalid = [name for name in names if name not in valid]
+    if invalid:
+        raise ValueError(
+            f"Unsupported eval profile(s): {', '.join(invalid)}. "
+            f"Choose from: {', '.join(sorted(valid))}"
+        )
+
+    profiles = []
+    for name in names:
+        if name == "natural":
+            profiles.append(
+                {
+                    "name": "natural",
+                    "max_new_tokens": natural_max_new_tokens or max_new_tokens,
+                    "min_new_tokens": natural_min_new_tokens,
+                }
+            )
+            continue
+
+        controlled_max = controlled_max_new_tokens or max_new_tokens
+        controlled_min = controlled_min_new_tokens
+        if controlled_min is None:
+            if min_new_tokens is not None:
+                controlled_min = min_new_tokens
+            else:
+                controlled_min = max(64, min(128, controlled_max // 2))
+        controlled_min = min(controlled_min, controlled_max)
+        profiles.append(
+            {
+                "name": "controlled",
+                "max_new_tokens": controlled_max,
+                "min_new_tokens": controlled_min,
+            }
+        )
+
+    return profiles
+
+
+def resolve_eval_modes(mode_names):
+    """
+    Resolve named evaluation modes into concrete instruction settings.
+    """
+    names = [name.strip().lower() for name in str(mode_names).split(",") if name.strip()]
+    if not names:
+        names = ["implicit", "explicit"]
+
+    valid = {"implicit", "explicit"}
+    invalid = [name for name in names if name not in valid]
+    if invalid:
+        raise ValueError(
+            f"Unsupported eval mode(s): {', '.join(invalid)}. "
+            f"Choose from: {', '.join(sorted(valid))}"
+        )
+
+    resolved = []
+    seen = set()
+    mode_map = {"implicit": False, "explicit": True}
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        resolved.append((name, mode_map[name]))
+    return resolved
+
+
+def build_method_record_metrics(method, text):
+    """
+    Per-response, method-specific metrics used in richer analysis.
+    """
+    metrics = {}
+    if method == "acrostics":
+        details = acrostics_metrics(text, secret_sequence)
+        metrics.update(
+            {
+                "acrostics_initials": details["initials"],
+                "acrostics_expected_initials": details["expected_initials"],
+                "acrostics_prefix_match_rate": details["prefix_match_rate"],
+                "acrostics_sentence_match_rate": details["sentence_match_rate"],
+                "acrostics_secret_coverage": details["secret_coverage"],
+                "acrostics_full_secret_realized": details["full_secret_realized"],
+                "acrostics_levenshtein_distance": details["levenshtein_distance"],
+                "acrostics_normalized_levenshtein_distance": details["normalized_levenshtein_distance"],
+                "acrostics_sentence_count_bin": details["sentence_count_bin"],
+            }
+        )
+    return metrics
 
 
 class WatermarkRewardFunction:
@@ -344,9 +454,10 @@ def _looks_like_local_path(source):
         return True
 
     # Two-part strings can be either local relative paths or HF repo ids.
-    # Treat as local only if the top-level segment exists in cwd.
+    # Treat as local only if the full path exists in cwd (not just the
+    # top-level segment, which can false-positive on HF cache dirs).
     if len(parts) == 2:
-        return os.path.exists(parts[0])
+        return os.path.exists(normalized)
 
     return False
 
@@ -376,6 +487,24 @@ def resolve_pretrained_source(source, label):
         )
 
     return raw
+
+
+def resolve_eval_output_dir(model_source, explicit_output_dir=None):
+    """
+    Choose a deterministic eval output location for local checkpoints and base model ids.
+    """
+    if explicit_output_dir:
+        return explicit_output_dir
+
+    if _looks_like_local_path(model_source):
+        normalized = os.path.normpath(os.path.expanduser(str(model_source)))
+        parent_dir = os.path.dirname(normalized) or "."
+        return os.path.join(parent_dir, "eval_results")
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(model_source)).strip("_")
+    if not safe_name:
+        safe_name = "model"
+    return os.path.join("eval_results", safe_name)
 
 
 def build_grpo_config(base_training_args, generation_args, num_generations=4):
@@ -744,6 +873,9 @@ def evaluate_model_on_split(
     baseline_mean=None,
     baseline_std=None,
     reward_override_fn=None,
+    eval_profile_name="natural",
+    eval_temperature=0.7,
+    eval_top_p=0.9,
     max_new_tokens=512,
     min_new_tokens=None,
 ):
@@ -781,8 +913,8 @@ def evaluate_model_on_split(
             messages_batch=messages_batch,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
-            temperature=0.7,
-            top_p=0.9
+            temperature=eval_temperature,
+            top_p=eval_top_p
         )
 
         for query, response in zip(batch_queries, responses):
@@ -795,17 +927,18 @@ def evaluate_model_on_split(
                 score = det_score
             scores.append(score)
 
-            n_words = len(response.split())
-            n_chars = len(response)
+            response_metrics = response_stats(response)
+            method_metrics = build_method_record_metrics(method, response)
 
-            records.append({
+            record = {
                 "query": query,
                 "response": response,
                 "score": score,
                 "detector_score": det_score,
-                "n_words": n_words,
-                "n_chars": n_chars,
-            })
+                **response_metrics,
+                **method_metrics,
+            }
+            records.append(record)
 
         processed = end
         if processed % 10 == 0 or processed == total:
@@ -816,8 +949,14 @@ def evaluate_model_on_split(
     det_mean = float(np.mean(detector_scores)) if detector_scores else 0.0
     det_std = float(np.std(detector_scores)) if detector_scores else 0.0
     word_counts = [r["n_words"] for r in records]
+    char_counts = [r["n_chars"] for r in records]
+    sentence_counts = [r["n_sentences"] for r in records]
     mean_words = float(np.mean(word_counts)) if word_counts else 0.0
     std_words = float(np.std(word_counts)) if word_counts else 0.0
+    mean_chars = float(np.mean(char_counts)) if char_counts else 0.0
+    std_chars = float(np.std(char_counts)) if char_counts else 0.0
+    mean_sentences = float(np.mean(sentence_counts)) if sentence_counts else 0.0
+    std_sentences = float(np.std(sentence_counts)) if sentence_counts else 0.0
     normalized_mean = None
     if baseline_mean is not None:
         if baseline_std is not None and baseline_std > 0:
@@ -828,6 +967,7 @@ def evaluate_model_on_split(
     summary = {
         "dataset": dataset_name,
         "split": split_name,
+        "eval_profile": eval_profile_name,
         "method": method,
         "include_instruction": include_instruction,
         "num_samples": len(scores),
@@ -835,29 +975,75 @@ def evaluate_model_on_split(
         "std_score": std,
         "mean_words": mean_words,
         "std_words": std_words,
+        "mean_chars": mean_chars,
+        "std_chars": std_chars,
+        "mean_sentences": mean_sentences,
+        "std_sentences": std_sentences,
+        "eval_temperature": eval_temperature,
+        "eval_top_p": eval_top_p,
+        "max_new_tokens": max_new_tokens,
+        "min_new_tokens": min_new_tokens,
     }
     if reward_override_fn is not None:
         summary["detector_mean_score"] = det_mean
         summary["detector_std_score"] = det_std
     if normalized_mean is not None:
         summary["mean_score_vs_baseline_z"] = normalized_mean
+    else:
+        summary["mean_score_vs_baseline_z"] = None
+
+    if method == "acrostics" and records:
+        prefix_rates = [record["acrostics_prefix_match_rate"] for record in records]
+        sentence_rates = [record["acrostics_sentence_match_rate"] for record in records]
+        coverages = [record["acrostics_secret_coverage"] for record in records]
+        full_secret = [record["acrostics_full_secret_realized"] for record in records]
+        normalized_distances = [
+            record["acrostics_normalized_levenshtein_distance"] for record in records
+        ]
+        bin_hist = {}
+        for record in records:
+            bin_name = record["acrostics_sentence_count_bin"]
+            bin_hist[bin_name] = bin_hist.get(bin_name, 0) + 1
+
+        summary.update(
+            {
+                "acrostics_mean_prefix_match_rate": float(np.mean(prefix_rates)),
+                "acrostics_mean_sentence_match_rate": float(np.mean(sentence_rates)),
+                "acrostics_mean_secret_coverage": float(np.mean(coverages)),
+                "acrostics_full_secret_realization_rate": float(np.mean(full_secret)),
+                "acrostics_mean_normalized_levenshtein_distance": float(
+                    np.mean(normalized_distances)
+                ),
+                "acrostics_sentence_count_bins": bin_hist,
+            }
+        )
 
     output = {
         "summary": summary,
         "samples": records
     }
 
-    eval_path = os.path.join(output_dir, f"eval_{dataset_name}_{split_name}.json")
+    eval_path = os.path.join(output_dir, f"eval_{dataset_name}_{split_name}_{eval_profile_name}.json")
     with open(eval_path, "w") as f:
         json.dump(output, f, indent=2)
 
     print(f"✓ Saved {split_name} evaluation to: {eval_path}")
     print(f"  Mean score: {mean:.4f}, Std: {std:.4f}")
-    print(f"  Response length: {mean_words:.0f} ± {std_words:.0f} words")
+    print(
+        f"  Response length: {mean_words:.0f} ± {std_words:.0f} words | "
+        f"{mean_sentences:.1f} ± {std_sentences:.1f} sentences"
+    )
     if reward_override_fn is not None:
         print(f"  Detector score: {det_mean:.4f}, Std: {det_std:.4f}")
     if normalized_mean is not None:
         print(f"  Mean score vs training baseline (z): {normalized_mean:.4f}")
+    if method == "acrostics" and records:
+        print(
+            "  Acrostics metrics: "
+            f"prefix={summary['acrostics_mean_prefix_match_rate']:.4f}, "
+            f"cycle={summary['acrostics_mean_sentence_match_rate']:.4f}, "
+            f"coverage={summary['acrostics_mean_secret_coverage']:.4f}"
+        )
 
     return summary
 
@@ -874,6 +1060,8 @@ def train_grpo(
     eval_samples=50,
     train_dataset_name="eli5",
     eval_dataset_names="eli5,alpaca",
+    eval_profiles="natural",
+    eval_modes=None,
     eval_no_instruction=True,
     generation_batch_size=4,
     prompt_variant="paper",
@@ -896,8 +1084,13 @@ def train_grpo(
     max_abs_reward=10.0,
     num_generations=4,
     max_new_tokens=200,
+    min_new_tokens=None,
     generation_temperature=0.7,
     generation_top_p=0.9,
+    natural_max_new_tokens=None,
+    natural_min_new_tokens=None,
+    controlled_max_new_tokens=None,
+    controlled_min_new_tokens=None,
     remove_invalid_values=True,
     require_explicit_reference=True,
     beta=0.04,
@@ -919,6 +1112,8 @@ def train_grpo(
         eval_samples: Number of samples for each evaluation split
         train_dataset_name: Dataset for GRPO training
         eval_dataset_names: Comma-separated list of datasets for post-training eval
+        eval_profiles: Comma-separated evaluation generation profiles
+        eval_modes: Comma-separated evaluation modes (implicit, explicit)
         eval_no_instruction: Disable watermark instruction during eval
         warm_start_model_path: Optional SFT checkpoint path used to initialize policy
         reference_model_path: Optional override for KL reference policy
@@ -926,6 +1121,7 @@ def train_grpo(
         reward_shaping: Add explicit shaping terms for partial progress/format/length
         num_generations: Number of sampled completions per prompt
         max_new_tokens: Max tokens generated per completion
+        min_new_tokens: Optional minimum tokens generated per response during controlled eval
         generation_temperature: Sampling temperature used during GRPO rollouts
         generation_top_p: Nucleus sampling top-p used during GRPO rollouts
         remove_invalid_values: Filter inf/nan logits during generation for stability
@@ -949,6 +1145,8 @@ def train_grpo(
             f"Invalid rules_variant '{rules_variant}'. "
             f"Choose from: {', '.join(sorted(valid_rules_variants))}"
         )
+    if eval_modes is None:
+        eval_modes = "implicit,explicit" if eval_no_instruction else "explicit"
 
     # Configure prompt/rule variants consumed by main.py prompt builders.
     os.environ["ICW_PROMPT_VARIANT"] = prompt_variant
@@ -1005,6 +1203,8 @@ def train_grpo(
     print(f"Eval Without Instructions: {eval_no_instruction}")
     print(f"Eval Splits: {eval_splits}")
     print(f"Eval Datasets: {eval_dataset_names}")
+    print(f"Eval Profiles: {eval_profiles}")
+    print(f"Eval Modes: {eval_modes}")
     print("="*80 + "\n")
 
     if GRPOConfig is None or GRPOTrainer is None:
@@ -1152,7 +1352,9 @@ def train_grpo(
         method,
         num_samples=min(50, num_train_samples),
         generation_batch_size=generation_batch_size,
-        reward_override_fn=_baseline_reward_override
+        reward_override_fn=_baseline_reward_override,
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=min_new_tokens,
     )
 
     # Create reward function
@@ -1287,6 +1489,7 @@ def train_grpo(
     print(f"Saving final model to {final_model_path}...")
     trainer.save_model(final_model_path)
     tokenizer.save_pretrained(final_model_path)
+    patch_saved_model_config(final_model_path, model_name)
 
     # Save training metadata
     metadata = {
@@ -1309,6 +1512,8 @@ def train_grpo(
         "learning_rate": learning_rate,
         "train_dataset_name": train_dataset_name,
         "eval_dataset_names": eval_dataset_names,
+        "eval_profiles": eval_profiles,
+        "eval_modes": eval_modes,
         "prompt_variant": prompt_variant,
         "rules_variant": rules_variant,
         "base_system_prompt": get_base_system_prompt(),
@@ -1328,6 +1533,11 @@ def train_grpo(
         "beta": beta,
         "num_generations": num_generations,
         "max_new_tokens": max_new_tokens,
+        "min_new_tokens": min_new_tokens,
+        "natural_max_new_tokens": natural_max_new_tokens,
+        "natural_min_new_tokens": natural_min_new_tokens,
+        "controlled_max_new_tokens": controlled_max_new_tokens,
+        "controlled_min_new_tokens": controlled_min_new_tokens,
         "generation_temperature": generation_temperature,
         "generation_top_p": generation_top_p,
         "remove_invalid_values": remove_invalid_values,
@@ -1349,6 +1559,16 @@ def train_grpo(
     if eval_splits:
         split_list = [s.strip() for s in eval_splits.split(",") if s.strip()]
         dataset_list = [d.strip().lower() for d in eval_dataset_names.split(",") if d.strip()]
+        profile_specs = resolve_eval_profiles(
+            profile_names=eval_profiles,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            natural_max_new_tokens=natural_max_new_tokens,
+            natural_min_new_tokens=natural_min_new_tokens,
+            controlled_max_new_tokens=controlled_max_new_tokens,
+            controlled_min_new_tokens=controlled_min_new_tokens,
+        )
+        eval_mode_specs = resolve_eval_modes(eval_modes)
         valid_datasets = {"eli5", "alpaca"}
         for dataset_name in dataset_list:
             if dataset_name not in valid_datasets:
@@ -1356,15 +1576,9 @@ def train_grpo(
                     f"Unknown eval dataset '{dataset_name}', skipping. "
                     f"Supported: {', '.join(sorted(valid_datasets))}"
                 )
-        # Eval modes: always run implicit (no instruction); also run explicit
-        # if eval_no_instruction is True (the default), we do both.
-        eval_modes = [
-            ("implicit", False),   # no watermark instruction
-            ("explicit", True),    # with watermark instruction
-        ]
         if split_list:
             print("\n" + "="*80)
-            print("POST-TRAINING EVALUATION (dual mode: explicit + implicit)")
+            print("POST-TRAINING EVALUATION")
             print("="*80)
 
             for dataset_name in dataset_list:
@@ -1381,25 +1595,33 @@ def train_grpo(
                         print(f"⚠️  Skipping evaluation for {dataset_name}:{split_name}")
                         continue
 
-                    for mode_label, use_instruction in eval_modes:
-                        eval_split_label = f"{split_name}_{mode_label}"
-                        print(f"\n--- {dataset_name}:{split_name} [{mode_label}] "
-                              f"(instruction={'yes' if use_instruction else 'no'}) ---")
-                        evaluate_model_on_split(
-                            model=model,
-                            tokenizer=tokenizer,
-                            dataset=eval_dataset,
-                            method=method,
-                            prompt_fn=prompt_fn,
-                            include_instruction=use_instruction,
-                            max_samples=eval_samples,
-                            output_dir=training_args.output_dir,
-                            split_name=eval_split_label,
-                            dataset_name=dataset_name,
-                            generation_batch_size=generation_batch_size,
-                            baseline_mean=baseline_mean,
-                            baseline_std=baseline_std,
-                        )
+                    for profile in profile_specs:
+                        for mode_label, use_instruction in eval_mode_specs:
+                            eval_split_label = f"{split_name}_{mode_label}"
+                            print(
+                                f"\n--- {dataset_name}:{split_name} [{mode_label}] "
+                                f"[{profile['name']}] "
+                                f"(instruction={'yes' if use_instruction else 'no'}) ---"
+                            )
+                            evaluate_model_on_split(
+                                model=model,
+                                tokenizer=tokenizer,
+                                dataset=eval_dataset,
+                                method=method,
+                                prompt_fn=prompt_fn,
+                                include_instruction=use_instruction,
+                                max_samples=eval_samples,
+                                output_dir=training_args.output_dir,
+                                split_name=eval_split_label,
+                                dataset_name=dataset_name,
+                                generation_batch_size=generation_batch_size,
+                                baseline_mean=baseline_mean,
+                                baseline_std=baseline_std,
+                                reward_override_fn=_baseline_reward_override,
+                                eval_profile_name=profile["name"],
+                                max_new_tokens=profile["max_new_tokens"],
+                                min_new_tokens=profile["min_new_tokens"],
+                            )
 
     return final_model_path
 
@@ -1491,6 +1713,19 @@ Examples:
         default='eli5,alpaca',
         help='Comma-separated datasets for post-training evaluation (default: eli5,alpaca)'
     )
+    parser.add_argument(
+        '--eval-profiles',
+        type=str,
+        default='natural',
+        help="Comma-separated eval generation profiles: natural, controlled (default: natural)"
+    )
+    parser.add_argument(
+        '--eval-modes',
+        type=str,
+        default=None,
+        help="Comma-separated eval modes: implicit, explicit. "
+             "Defaults to implicit,explicit unless legacy --eval-with-instruction is used."
+    )
 
     parser.add_argument(
         '--eval-no-instruction',
@@ -1546,8 +1781,32 @@ Examples:
         '--min-new-tokens',
         type=int,
         default=None,
-        help='Min tokens generated per response during eval (default: None). '
-             'Helps ensure responses are long enough for reliable detector scores.'
+        help='Default min tokens generated per response for controlled eval (default: None). '
+             'If unset, the controlled profile chooses a conservative floor automatically.'
+    )
+    parser.add_argument(
+        '--natural-max-new-tokens',
+        type=int,
+        default=None,
+        help='Override max_new_tokens for the natural eval profile'
+    )
+    parser.add_argument(
+        '--natural-min-new-tokens',
+        type=int,
+        default=None,
+        help='Override min_new_tokens for the natural eval profile'
+    )
+    parser.add_argument(
+        '--controlled-max-new-tokens',
+        type=int,
+        default=None,
+        help='Override max_new_tokens for the controlled eval profile'
+    )
+    parser.add_argument(
+        '--controlled-min-new-tokens',
+        type=int,
+        default=None,
+        help='Override min_new_tokens for the controlled eval profile'
     )
 
     parser.add_argument(
@@ -1729,6 +1988,12 @@ Examples:
         help='Skip training; only run dual eval (explicit + implicit) on an existing model. '
              'Pass the path to a saved model directory (e.g. sft_models/.../final_model).'
     )
+    parser.add_argument(
+        '--eval-output-dir',
+        type=str,
+        default=None,
+        help='Directory for eval-only artifacts. Defaults next to local checkpoints or under eval_results/<model_id>.'
+    )
 
     parser.add_argument(
         '--output-dir',
@@ -1756,6 +2021,17 @@ Examples:
         parser.error("--num-generations must be >= 1")
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be >= 1")
+    if args.min_new_tokens is not None and args.min_new_tokens < 1:
+        parser.error("--min-new-tokens must be >= 1 when set")
+    for arg_name in (
+        "natural_max_new_tokens",
+        "natural_min_new_tokens",
+        "controlled_max_new_tokens",
+        "controlled_min_new_tokens",
+    ):
+        arg_value = getattr(args, arg_name)
+        if arg_value is not None and arg_value < 1:
+            parser.error(f"--{arg_name.replace('_', '-')} must be >= 1 when set")
     if args.temperature <= 0:
         parser.error("--temperature must be > 0")
     if not (0 < args.top_p <= 1):
@@ -1774,8 +2050,14 @@ Examples:
         parser.error("--reference-model cannot be set together with --no-reference-model")
     if not (0.0 <= args.implicit_fraction <= 1.0):
         parser.error("--implicit-fraction must be in [0.0, 1.0]")
+    if args.eval_modes is None:
+        args.eval_modes = "implicit,explicit" if args.eval_no_instruction else "explicit"
+    try:
+        resolve_eval_modes(args.eval_modes)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    # Eval-only mode: load an existing model and run dual eval
+    # Eval-only mode: load an existing model and run profile-aware eval
     if args.eval_only is not None:
         print("\n" + "="*80)
         print("EVAL-ONLY MODE")
@@ -1786,7 +2068,16 @@ Examples:
 
         config = get_model_config(args.model)
         model_name = config["model_name"]
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer_source = args.eval_only
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+        except Exception:
+            if tokenizer_source != model_name:
+                warnings.warn(
+                    f"Could not load tokenizer from '{tokenizer_source}'. "
+                    f"Falling back to base model tokenizer '{model_name}'."
+                )
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         if getattr(tokenizer, "padding_side", "right") != "left":
@@ -1810,26 +2101,56 @@ Examples:
             seed=args.seed
         )
 
+        eval_reward_override = None
+        if args.method == "acrostics":
+            eval_reward_override = WatermarkRewardFunction(args.method)._acrostics_sentence_reward
+
         baseline_mean, baseline_std = compute_baseline_statistics(
             model, tokenizer, dataset, args.method,
             num_samples=min(50, args.samples),
             generation_batch_size=args.gen_batch_size,
+            reward_override_fn=eval_reward_override,
             max_new_tokens=args.max_new_tokens,
             min_new_tokens=args.min_new_tokens,
         )
 
-        eval_output_dir = os.path.join(
-            os.path.dirname(args.eval_only) or ".",
-            "eval_results"
-        )
+        eval_output_dir = resolve_eval_output_dir(args.eval_only, args.eval_output_dir)
         os.makedirs(eval_output_dir, exist_ok=True)
 
         split_list = [s.strip() for s in args.eval_splits.split(",") if s.strip()]
         dataset_list = [d.strip().lower() for d in args.eval_datasets.split(",") if d.strip()]
-        eval_modes = [("implicit", False), ("explicit", True)]
+        profile_specs = resolve_eval_profiles(
+            profile_names=args.eval_profiles,
+            max_new_tokens=args.max_new_tokens,
+            min_new_tokens=args.min_new_tokens,
+            natural_max_new_tokens=args.natural_max_new_tokens,
+            natural_min_new_tokens=args.natural_min_new_tokens,
+            controlled_max_new_tokens=args.controlled_max_new_tokens,
+            controlled_min_new_tokens=args.controlled_min_new_tokens,
+        )
+        eval_mode_specs = resolve_eval_modes(args.eval_modes)
+        eval_manifest = {
+            "created_at": datetime.now().isoformat(),
+            "model_source": args.eval_only,
+            "method": args.method,
+            "model_strategy": args.model,
+            "train_dataset": args.train_dataset,
+            "eval_datasets": dataset_list,
+            "eval_splits": split_list,
+            "eval_profiles": args.eval_profiles,
+            "eval_modes": args.eval_modes,
+            "eval_samples": args.eval_samples,
+            "seed": args.seed,
+            "max_new_tokens": args.max_new_tokens,
+            "min_new_tokens": args.min_new_tokens,
+            "baseline_mean": baseline_mean,
+            "baseline_std": baseline_std,
+        }
+        with open(os.path.join(eval_output_dir, "eval_manifest.json"), "w") as handle:
+            json.dump(eval_manifest, handle, indent=2)
 
         print("\n" + "="*80)
-        print("DUAL EVALUATION (explicit + implicit)")
+        print("PROFILE-AWARE EVALUATION")
         print("="*80)
 
         for dataset_name in dataset_list:
@@ -1843,27 +2164,33 @@ Examples:
                 if eval_dataset is None:
                     print(f"⚠️  Skipping {dataset_name}:{split_name}")
                     continue
-                for mode_label, use_instruction in eval_modes:
-                    eval_split_label = f"{split_name}_{mode_label}"
-                    print(f"\n--- {dataset_name}:{split_name} [{mode_label}] "
-                          f"(instruction={'yes' if use_instruction else 'no'}) ---")
-                    evaluate_model_on_split(
-                        model=model,
-                        tokenizer=tokenizer,
-                        dataset=eval_dataset,
-                        method=args.method,
-                        prompt_fn=prompt_fn,
-                        include_instruction=use_instruction,
-                        max_samples=args.eval_samples,
-                        output_dir=eval_output_dir,
-                        split_name=eval_split_label,
-                        dataset_name=dataset_name,
-                        generation_batch_size=args.gen_batch_size,
-                        baseline_mean=baseline_mean,
-                        baseline_std=baseline_std,
-                        max_new_tokens=args.max_new_tokens,
-                        min_new_tokens=args.min_new_tokens,
-                    )
+                for profile in profile_specs:
+                    for mode_label, use_instruction in eval_mode_specs:
+                        eval_split_label = f"{split_name}_{mode_label}"
+                        print(
+                            f"\n--- {dataset_name}:{split_name} [{mode_label}] "
+                            f"[{profile['name']}] "
+                            f"(instruction={'yes' if use_instruction else 'no'}) ---"
+                        )
+                        evaluate_model_on_split(
+                            model=model,
+                            tokenizer=tokenizer,
+                            dataset=eval_dataset,
+                            method=args.method,
+                            prompt_fn=prompt_fn,
+                            include_instruction=use_instruction,
+                            max_samples=args.eval_samples,
+                            output_dir=eval_output_dir,
+                            split_name=eval_split_label,
+                            dataset_name=dataset_name,
+                            generation_batch_size=args.gen_batch_size,
+                            baseline_mean=baseline_mean,
+                            baseline_std=baseline_std,
+                            reward_override_fn=eval_reward_override,
+                            eval_profile_name=profile["name"],
+                            max_new_tokens=profile["max_new_tokens"],
+                            min_new_tokens=profile["min_new_tokens"],
+                        )
 
         print(f"\n✓ Eval results saved to: {eval_output_dir}")
         return
@@ -1881,6 +2208,8 @@ Examples:
         eval_samples=args.eval_samples,
         train_dataset_name=args.train_dataset,
         eval_dataset_names=args.eval_datasets,
+        eval_profiles=args.eval_profiles,
+        eval_modes=args.eval_modes,
         eval_no_instruction=args.eval_no_instruction,
         generation_batch_size=args.gen_batch_size,
         prompt_variant=args.prompt_variant,
@@ -1903,8 +2232,13 @@ Examples:
         max_abs_reward=args.max_abs_reward,
         num_generations=args.num_generations,
         max_new_tokens=args.max_new_tokens,
+        min_new_tokens=args.min_new_tokens,
         generation_temperature=args.temperature,
         generation_top_p=args.top_p,
+        natural_max_new_tokens=args.natural_max_new_tokens,
+        natural_min_new_tokens=args.natural_min_new_tokens,
+        controlled_max_new_tokens=args.controlled_max_new_tokens,
+        controlled_min_new_tokens=args.controlled_min_new_tokens,
         remove_invalid_values=args.remove_invalid_values,
         require_explicit_reference=args.require_explicit_reference,
         beta=args.beta,

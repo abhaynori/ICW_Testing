@@ -116,13 +116,13 @@ def load_queries(dataset_name="eli5", split="train", num_samples=500):
     queries = []
 
     if dataset_key == "eli5":
-        ds = load_dataset("sentence-transformers/eli5", "pair", split=split)
-        for row in ds:
+        ds = load_dataset("sentence-transformers/eli5", "pair", split="train")
+        start, end = _slice_indices_for_split(len(ds), split)
+        subset = ds.select(range(start, min(end, start + num_samples)))
+        for row in subset:
             q = (row.get("question") or "").strip()
             if q:
                 queries.append(q)
-            if len(queries) >= num_samples:
-                break
         return queries
 
     if dataset_key == "alpaca":

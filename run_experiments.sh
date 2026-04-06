@@ -196,7 +196,7 @@ for SFT_DIR in sft_models/sft_${METHOD}_${MODEL}_*/final_model; do
                 2>&1 | tee "${LOGDIR}/grpo/${TAG}_train.log"
 
             # Find the GRPO model just created
-            GRPO_MODEL=$(ls -td grpo_models/grpo_${METHOD}_*/final_model 2>/dev/null | head -1)
+            GRPO_MODEL=$(ls -td grpo_models/${METHOD}_${MODEL}_*/final_model 2>/dev/null | head -1)
             if [ -z "$GRPO_MODEL" ]; then
                 echo "WARNING: GRPO model not found for ${TAG}, skipping eval."
                 continue

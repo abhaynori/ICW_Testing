@@ -43,6 +43,7 @@ from main import (
     unicode_embed_prompt,
 )
 from memory_config import get_model_config
+from research_utils import patch_saved_model_config
 
 
 def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=None):
@@ -193,8 +194,10 @@ def load_sft_pairs(dataset_name="eli5", split="train", num_samples=500):
         return pairs
 
     if dataset_key == "eli5":
-        dataset = load_dataset("sentence-transformers/eli5", "pair", split=split)
-        for row in dataset:
+        dataset = load_dataset("sentence-transformers/eli5", "pair", split="train")
+        start, end = _slice_indices_for_split(len(dataset), split)
+        subset = dataset.select(range(start, end))
+        for row in subset:
             query = (row.get("question") or "").strip()
             target = _clean_target(_extract_eli5_answer(row))
             if query and target:
@@ -361,6 +364,7 @@ def train_sft(
     lora_target_modules="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
     sft_data_path=None,
     mix_ratio=0.0,
+    seed=42,
 ):
     valid_prompt_variants = {"paper", "concise", "strict"}
     valid_rules_variants = {"paper", "minimal", "none"}
@@ -396,6 +400,7 @@ def train_sft(
     print(f"Epochs: {num_epochs}")
     print(f"Batch Size: {batch_size}")
     print(f"Learning Rate: {learning_rate}")
+    print(f"Seed: {seed}")
     print(f"Max Sequence Length: {max_length}")
     print(f"Include WM Instruction: {include_instruction}")
     print(f"Use LoRA: {use_lora}")
@@ -404,6 +409,12 @@ def train_sft(
 
     config = get_model_config(model_strategy)
     model_name = config["model_name"]
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if getattr(tokenizer, "padding_side", "right") != "right":
@@ -519,7 +530,7 @@ def train_sft(
         )
         # Interleave and shuffle
         from datasets import concatenate_datasets
-        train_dataset = concatenate_datasets([wm_dataset, reg_dataset]).shuffle(seed=42)
+        train_dataset = concatenate_datasets([wm_dataset, reg_dataset]).shuffle(seed=seed)
         print(f"✓ Built {len(train_dataset)} tokenized training examples "
               f"({len(wm_dataset)} watermark + {len(reg_dataset)} regular)")
     else:
@@ -557,7 +568,7 @@ def train_sft(
         report_to=[],
         remove_unused_columns=False,
         gradient_checkpointing=True,
-        seed=42,
+        seed=seed,
     )
 
     trainer = build_transformers_trainer(
@@ -575,22 +586,9 @@ def train_sft(
     final_model_path = os.path.join(run_output_dir, "final_model")
     trainer.save_model(final_model_path)
     tokenizer.save_pretrained(final_model_path)
-
-    # Ensure config.json has model_type for lm_eval compatibility
-    final_config_path = os.path.join(final_model_path, "config.json")
-    if os.path.exists(final_config_path):
-        with open(final_config_path, "r") as f:
-            saved_config = json.load(f)
-        if "model_type" not in saved_config:
-            # Copy model_type from base model config
-            from transformers import AutoConfig
-            base_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            saved_config["model_type"] = base_config.model_type
-            if hasattr(base_config, "architectures"):
-                saved_config["architectures"] = base_config.architectures
-            with open(final_config_path, "w") as f:
-                json.dump(saved_config, f, indent=2)
-            print(f"✓ Patched config.json with model_type={base_config.model_type}")
+    patched_config_path = patch_saved_model_config(final_model_path, model_name)
+    if patched_config_path:
+        print(f"✓ Ensured config metadata for downstream eval: {patched_config_path}")
 
     metadata = {
         "base_model": model_name,
@@ -601,6 +599,7 @@ def train_sft(
         "num_epochs": num_epochs,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
+        "seed": seed,
         "max_length": max_length,
         "train_dataset_name": train_dataset_name,
         "train_split": train_split,
@@ -690,6 +689,12 @@ Examples:
         default="eli5",
         choices=["eli5", "alpaca"],
         help="Dataset used for SFT training (default: eli5)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for data ordering and trainer state (default: 42)",
     )
     parser.add_argument(
         "--train-split",
@@ -835,6 +840,8 @@ Examples:
         parser.error("--lora-dropout must be in [0, 1)")
     if args.mix_ratio < 0 or args.mix_ratio >= 1:
         parser.error("--mix-ratio must be in [0, 1)")
+    if args.seed < 0:
+        parser.error("--seed must be >= 0")
 
     train_sft(
         model_strategy=args.model,
@@ -861,6 +868,7 @@ Examples:
         lora_target_modules=args.lora_target_modules,
         sft_data_path=args.sft_data,
         mix_ratio=args.mix_ratio,
+        seed=args.seed,
     )
 
 

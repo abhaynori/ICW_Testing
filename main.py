@@ -163,8 +163,12 @@ def load_queries(dataset_name, split, num_samples):
     """Load prompt queries from supported datasets."""
     dataset_key = dataset_name.strip().lower()
     if dataset_key == "eli5":
-        dataset = load_dataset("sentence-transformers/eli5", "pair", split=split)
-        return dataset["question"][:num_samples]
+        # Keep ELI5 split semantics consistent with the training scripts even in
+        # environments where only the train split is exposed.
+        dataset = load_dataset("sentence-transformers/eli5", "pair", split="train")
+        start, end = _slice_indices_for_split(len(dataset), split)
+        sampled = dataset.select(range(start, min(end, start + num_samples)))
+        return sampled["question"]
 
     if dataset_key == "alpaca":
         dataset = load_dataset("yahma/alpaca-cleaned", split="train")
@@ -924,6 +928,7 @@ def run_pipeline():
     DATASET_SPLIT = os.getenv('ICW_DATASET_SPLIT', "train")
     GENERATION_BATCH_SIZE = max(1, int(os.getenv('ICW_GENERATION_BATCH_SIZE', '4')))
     SHOW_PLOTS = os.getenv('ICW_SHOW_PLOTS', '0').lower() in {"1", "true", "yes"}
+    SHOW_PAPER_COMPARISON = os.getenv('ICW_SHOW_PAPER_COMPARISON', '0').lower() in {"1", "true", "yes"}
     OUTPUT_DIR = os.getenv('ICW_OUTPUT_DIR', "outputs")
     DISABLE_WM_INSTRUCTION = os.getenv('ICW_DISABLE_WM_INSTRUCTION', '0').lower() in {"1", "true", "yes"}
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -962,6 +967,7 @@ def run_pipeline():
     print(f"Rules Variant: {get_rules_variant()}")
     print(f"Base System Prompt: {get_base_system_prompt()}")
     print(f"Show Plots: {SHOW_PLOTS}")
+    print(f"Show Paper Comparison: {SHOW_PAPER_COMPARISON}")
     print(f"Watermark Instructions Disabled: {DISABLE_WM_INSTRUCTION}")
     print(f"{'='*80}")
 
@@ -1243,7 +1249,7 @@ def run_pipeline():
     df = pd.DataFrame(results)
     print("\n" + df.to_string(index=False))
 
-    if not DISABLE_WM_INSTRUCTION:
+    if not DISABLE_WM_INSTRUCTION and SHOW_PAPER_COMPARISON:
         # Compare to paper's results
         print("\n" + "="*80)
         print("COMPARISON TO PAPER (GPT-4o-mini results)")
@@ -1263,8 +1269,9 @@ def run_pipeline():
             paper_auc = paper_results[method]["ROC-AUC"]
             paper_tpr = paper_results[method]["TPR@1%FPR"]
             print(f"{method:15} | {your_auc:12.4f} | {paper_auc:13.4f} | {your_tpr:11.4f} | {paper_tpr:12.4f}")
-
         print("\nNote: Paper uses GPT-4o-mini. Your model is smaller, so lower results are expected.")
+    elif not DISABLE_WM_INSTRUCTION:
+        print("\nPaper comparison hidden by default. Set ICW_SHOW_PAPER_COMPARISON=1 to enable it.")
     else:
         print("\nNo-instruction mode: detector-score summaries are reported instead of ROC curves.")
 
@@ -1274,50 +1281,53 @@ def run_pipeline():
     print(f"\n✓ Results saved to {results_file}")
 
     # Visualizations
-    if DISABLE_WM_INSTRUCTION:
-        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
-        ax.bar(df["Method"], df["Mean Score"], yerr=df["Std Score"], capsize=4, color="steelblue")
-        ax.set_ylabel("Detector Mean Score", fontsize=11)
-        ax.set_title("No-Instruction Detector Scores", fontsize=12, fontweight="bold")
-        ax.tick_params(axis='x', rotation=45)
-        ax.grid(axis='y', alpha=0.3)
-        plt.tight_layout()
-        plot_file = os.path.join(OUTPUT_DIR, "icw_detector_scores.png")
+    if _ensure_matplotlib():
+        if DISABLE_WM_INSTRUCTION:
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+            ax.bar(df["Method"], df["Mean Score"], yerr=df["Std Score"], capsize=4, color="steelblue")
+            ax.set_ylabel("Detector Mean Score", fontsize=11)
+            ax.set_title("No-Instruction Detector Scores", fontsize=12, fontweight="bold")
+            ax.tick_params(axis='x', rotation=45)
+            ax.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            plot_file = os.path.join(OUTPUT_DIR, "icw_detector_scores.png")
+        else:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+            axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
+            axes[0].set_ylabel("ROC-AUC", fontsize=11)
+            axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
+            axes[0].set_ylim(0, 1)
+            axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.3, label='Random')
+            axes[0].tick_params(axis='x', rotation=45)
+            axes[0].legend()
+            axes[0].grid(axis='y', alpha=0.3)
+
+            axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
+            axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
+            axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
+            axes[1].set_ylim(0, 1)
+            axes[1].tick_params(axis='x', rotation=45)
+            axes[1].grid(axis='y', alpha=0.3)
+
+            axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
+            axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
+            axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
+            axes[2].set_ylim(0, 1)
+            axes[2].tick_params(axis='x', rotation=45)
+            axes[2].grid(axis='y', alpha=0.3)
+
+            plt.tight_layout()
+            plot_file = os.path.join(OUTPUT_DIR, "icw_evaluation.png")
+
+        plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+        print(f"✓ Plots saved to {plot_file}")
+        if SHOW_PLOTS:
+            plt.show()
+        else:
+            plt.close(fig)
     else:
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-        axes[0].bar(df["Method"], df["ROC-AUC"], color="skyblue", edgecolor="navy")
-        axes[0].set_ylabel("ROC-AUC", fontsize=11)
-        axes[0].set_title("ROC-AUC Score", fontsize=12, fontweight="bold")
-        axes[0].set_ylim(0, 1)
-        axes[0].axhline(y=0.5, color='r', linestyle='--', alpha=0.3, label='Random')
-        axes[0].tick_params(axis='x', rotation=45)
-        axes[0].legend()
-        axes[0].grid(axis='y', alpha=0.3)
-
-        axes[1].bar(df["Method"], df["TPR@1%FPR"], color="lightcoral", edgecolor="darkred")
-        axes[1].set_ylabel("TPR @ 1% FPR", fontsize=11)
-        axes[1].set_title("True Positive Rate at 1% FPR", fontsize=12, fontweight="bold")
-        axes[1].set_ylim(0, 1)
-        axes[1].tick_params(axis='x', rotation=45)
-        axes[1].grid(axis='y', alpha=0.3)
-
-        axes[2].bar(df["Method"], df["TPR@10%FPR"], color="lightgreen", edgecolor="darkgreen")
-        axes[2].set_ylabel("TPR @ 10% FPR", fontsize=11)
-        axes[2].set_title("True Positive Rate at 10% FPR", fontsize=12, fontweight="bold")
-        axes[2].set_ylim(0, 1)
-        axes[2].tick_params(axis='x', rotation=45)
-        axes[2].grid(axis='y', alpha=0.3)
-
-        plt.tight_layout()
-        plot_file = os.path.join(OUTPUT_DIR, "icw_evaluation.png")
-
-    plt.savefig(plot_file, dpi=150, bbox_inches='tight')
-    print(f"✓ Plots saved to {plot_file}")
-    if SHOW_PLOTS:
-        plt.show()
-    else:
-        plt.close(fig)
+        print("⚠️  Plot export skipped because matplotlib is unavailable.")
 
     print("\n" + "="*80)
     print("EVALUATION COMPLETE")

@@ -50,6 +50,7 @@ from main import (
     get_base_system_prompt,
 )
 from memory_config import get_model_config
+from research_utils import patch_saved_model_config
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +170,13 @@ def prepare_dataset(num_samples, split="train", dataset_name="eli5", seed=42):
     dataset_key = dataset_name.strip().lower()
     if dataset_key == "eli5":
         try:
-            ds = load_dataset("sentence-transformers/eli5", "pair", split=split)
+            ds = load_dataset("sentence-transformers/eli5", "pair", split="train")
         except Exception as exc:
             warnings.warn(f"Could not load dataset 'eli5' split '{split}': {exc}")
             return None
-        queries = ds["question"][:num_samples]
+        start, end = _slice_indices_for_split(len(ds), split)
+        subset = ds.select(range(start, min(end, start + num_samples)))
+        queries = subset["question"]
     elif dataset_key == "alpaca":
         ds = load_dataset("yahma/alpaca-cleaned", split="train")
         start, end = _slice_indices_for_split(len(ds), split)
@@ -608,6 +611,7 @@ def train_dpo(
     final_model_path = os.path.join(run_output_dir, "final_model")
     trainer.save_model(final_model_path)
     tokenizer.save_pretrained(final_model_path)
+    patch_saved_model_config(final_model_path, model_name)
 
     metadata = {
         "base_model": model_name,

@@ -367,7 +367,7 @@ def build_utility_commands(
             "--model",
             "hf",
             "--model_args",
-            f"pretrained={trained_model_path},trust_remote_code=True",
+            f"pretrained={trained_model_path},trust_remote_code=True,apply_chat_template=True",
             "--tasks",
             task_clean,
             "--batch_size",
