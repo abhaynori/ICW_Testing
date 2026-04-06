@@ -20,7 +20,13 @@ try:
 except Exception:
     sent_tokenize = None
 
-from transformers import AutoConfig
+try:
+    from peft import AutoPeftModelForCausalLM, PeftConfig
+except Exception:
+    AutoPeftModelForCausalLM = None
+    PeftConfig = None
+
+from transformers import AutoConfig, AutoModelForCausalLM
 
 
 def fallback_sent_tokenize(text: str) -> list[str]:
@@ -134,6 +140,95 @@ def acrostics_metrics(text: str, secret_sequence: str) -> dict[str, Any]:
         "sentence_count_bin": sentence_count_bin(len(sentences)),
         "n_sentences": len(sentences),
     }
+
+
+def is_local_peft_checkpoint(model_name_or_path: str) -> bool:
+    path = os.path.normpath(os.path.expanduser(str(model_name_or_path)))
+    return os.path.isdir(path) and os.path.exists(os.path.join(path, "adapter_config.json"))
+
+
+def get_peft_base_model_name(model_name_or_path: str) -> str | None:
+    if not is_local_peft_checkpoint(model_name_or_path):
+        return None
+    if PeftConfig is None:
+        raise ImportError(
+            "PEFT is required to inspect local adapter checkpoints. Install with: pip install peft"
+        )
+    config = PeftConfig.from_pretrained(model_name_or_path)
+    return getattr(config, "base_model_name_or_path", None)
+
+
+def load_causal_lm_with_adapter_support(
+    model_name_or_path: str,
+    model_kwargs: dict[str, Any],
+    dtype_value=None,
+    is_trainable: bool = False,
+):
+    """
+    Load either a regular CausalLM or a local PEFT adapter checkpoint.
+    """
+    normalized = os.path.normpath(os.path.expanduser(str(model_name_or_path)))
+
+    def _load_regular(kwargs: dict[str, Any]):
+        return AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+
+    if is_local_peft_checkpoint(normalized):
+        if AutoPeftModelForCausalLM is None:
+            raise ImportError(
+                "PEFT is required to load local adapter checkpoints. Install with: pip install peft"
+            )
+
+        def _load_peft(kwargs: dict[str, Any]):
+            return AutoPeftModelForCausalLM.from_pretrained(
+                normalized,
+                is_trainable=is_trainable,
+                **kwargs,
+            )
+
+        if dtype_value is None:
+            return _load_peft(dict(model_kwargs))
+
+        modern_kwargs = dict(model_kwargs)
+        modern_kwargs["dtype"] = dtype_value
+        try:
+            return _load_peft(modern_kwargs)
+        except TypeError:
+            legacy_kwargs = dict(model_kwargs)
+            legacy_kwargs["torch_dtype"] = dtype_value
+            return _load_peft(legacy_kwargs)
+
+    if dtype_value is None:
+        return _load_regular(dict(model_kwargs))
+
+    modern_kwargs = dict(model_kwargs)
+    modern_kwargs["dtype"] = dtype_value
+    try:
+        return _load_regular(modern_kwargs)
+    except TypeError:
+        legacy_kwargs = dict(model_kwargs)
+        legacy_kwargs["torch_dtype"] = dtype_value
+        return _load_regular(legacy_kwargs)
+
+
+def build_lm_eval_model_args(model_name_or_path: str, trust_remote_code: bool = True) -> str:
+    """
+    Construct lm-eval model_args, using `peft=` when pointing at a local adapter.
+    """
+    normalized = os.path.normpath(os.path.expanduser(str(model_name_or_path)))
+    if is_local_peft_checkpoint(normalized):
+        base_model = get_peft_base_model_name(normalized)
+        if not base_model:
+            raise ValueError(
+                f"Could not determine base model for adapter checkpoint: {model_name_or_path}"
+            )
+        return (
+            f"pretrained={base_model},peft={normalized},"
+            f"trust_remote_code={'True' if trust_remote_code else 'False'}"
+        )
+    return (
+        f"pretrained={model_name_or_path},"
+        f"trust_remote_code={'True' if trust_remote_code else 'False'}"
+    )
 
 
 def patch_saved_model_config(model_dir: str, base_model_name: str) -> str | None:

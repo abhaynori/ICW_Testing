@@ -51,6 +51,7 @@ from main import (
 from memory_config import get_model_config
 from research_utils import (
     acrostics_metrics,
+    load_causal_lm_with_adapter_support,
     patch_saved_model_config,
     response_stats,
 )
@@ -414,17 +415,11 @@ def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=Non
     Load CausalLM model while handling dtype argument differences across
     transformers versions (`dtype` vs `torch_dtype`).
     """
-    if dtype_value is None:
-        return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-
-    modern_kwargs = dict(model_kwargs)
-    modern_kwargs["dtype"] = dtype_value
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_name, **modern_kwargs)
-    except TypeError:
-        legacy_kwargs = dict(model_kwargs)
-        legacy_kwargs["torch_dtype"] = dtype_value
-        return AutoModelForCausalLM.from_pretrained(model_name, **legacy_kwargs)
+    return load_causal_lm_with_adapter_support(
+        model_name_or_path=model_name,
+        model_kwargs=model_kwargs,
+        dtype_value=dtype_value,
+    )
 
 
 def _looks_like_local_path(source):
@@ -1269,10 +1264,11 @@ def train_grpo(
         model_kwargs["quantization_config"] = config["quantization"]
         dtype_value = None
 
-    model = load_causal_lm_with_dtype_fallback(
-        model_name=resolved_policy_source,
+    model = load_causal_lm_with_adapter_support(
+        model_name_or_path=resolved_policy_source,
         model_kwargs=model_kwargs,
         dtype_value=dtype_value,
+        is_trainable=bool(warm_start_model_path and use_lora),
     )
 
     if tokenizer.pad_token is None:

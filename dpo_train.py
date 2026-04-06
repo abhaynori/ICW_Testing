@@ -50,7 +50,7 @@ from main import (
     get_base_system_prompt,
 )
 from memory_config import get_model_config
-from research_utils import patch_saved_model_config
+from research_utils import load_causal_lm_with_adapter_support, patch_saved_model_config
 
 
 # ---------------------------------------------------------------------------
@@ -134,16 +134,11 @@ def resolve_pretrained_source(source, label):
 
 
 def load_causal_lm_with_dtype_fallback(model_name, model_kwargs, dtype_value=None):
-    if dtype_value is None:
-        return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
-    modern_kwargs = dict(model_kwargs)
-    modern_kwargs["dtype"] = dtype_value
-    try:
-        return AutoModelForCausalLM.from_pretrained(model_name, **modern_kwargs)
-    except TypeError:
-        legacy_kwargs = dict(model_kwargs)
-        legacy_kwargs["torch_dtype"] = dtype_value
-        return AutoModelForCausalLM.from_pretrained(model_name, **legacy_kwargs)
+    return load_causal_lm_with_adapter_support(
+        model_name_or_path=model_name,
+        model_kwargs=model_kwargs,
+        dtype_value=dtype_value,
+    )
 
 
 def _slice_indices_for_split(size, split):
@@ -442,10 +437,11 @@ def train_dpo(
         resolved_source = resolve_pretrained_source(warm_start_model_path, "Warm Start Model")
         print(f"Warm-starting from: {resolved_source}")
 
-    model = load_causal_lm_with_dtype_fallback(
-        model_name=resolved_source,
+    model = load_causal_lm_with_adapter_support(
+        model_name_or_path=resolved_source,
         model_kwargs=model_kwargs,
         dtype_value=dtype_value,
+        is_trainable=bool(warm_start_model_path and use_lora),
     )
 
     tokenizer = AutoTokenizer.from_pretrained(

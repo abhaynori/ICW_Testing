@@ -32,6 +32,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
+from research_utils import build_lm_eval_model_args
+
 
 SYSTEM_PROMPT_PROFILES = {
     "default": {
@@ -358,6 +360,7 @@ def build_utility_commands(
     lm_eval_launcher: list[str],
 ) -> dict[str, list[str]]:
     commands: dict[str, list[str]] = {}
+    model_args = build_lm_eval_model_args(trained_model_path, trust_remote_code=True)
     for task in tasks:
         task_clean = task.strip()
         if not task_clean:
@@ -368,7 +371,7 @@ def build_utility_commands(
             "hf",
             "--apply_chat_template",
             "--model_args",
-            f"pretrained={trained_model_path},trust_remote_code=True",
+            model_args,
             "--tasks",
             task_clean,
             "--batch_size",

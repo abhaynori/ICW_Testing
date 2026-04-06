@@ -78,6 +78,7 @@ def _extract_sentence_initials(sentences):
 # These are read at import time but only used by the main() function
 # and by log_generation / generate_response when running as a script.
 from memory_config import get_model_config
+from research_utils import load_causal_lm_with_adapter_support
 
 DEFAULT_BASE_SYSTEM_PROMPT = "You are a helpful assistant. Provide clear, informative answers."
 
@@ -993,12 +994,16 @@ def run_pipeline():
         "low_cpu_mem_usage": True
     }
 
+    dtype_value = config.get("dtype")
     if config.get("quantization"):
         model_kwargs["quantization_config"] = config["quantization"]
-    elif config.get("dtype"):
-        model_kwargs["torch_dtype"] = config["dtype"]
+        dtype_value = None
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, **model_kwargs)
+    model = load_causal_lm_with_adapter_support(
+        model_name_or_path=MODEL_NAME,
+        model_kwargs=model_kwargs,
+        dtype_value=dtype_value,
+    )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

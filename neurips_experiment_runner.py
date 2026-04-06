@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 from memory_config import get_model_config
+from research_utils import build_lm_eval_model_args
 
 
 SUPPORTED_ALGORITHMS = {
@@ -396,6 +397,7 @@ def build_utility_commands(
     lm_eval_launcher: list[str],
 ) -> dict[str, list[str]]:
     commands = {}
+    model_args = build_lm_eval_model_args(model_source, trust_remote_code=True)
     for task in parse_list(args.utility_tasks):
         commands[task] = [
             *lm_eval_launcher,
@@ -403,7 +405,7 @@ def build_utility_commands(
             "hf",
             "--apply_chat_template",
             "--model_args",
-            f"pretrained={model_source},trust_remote_code=True",
+            model_args,
             "--tasks",
             task,
             "--batch_size",
