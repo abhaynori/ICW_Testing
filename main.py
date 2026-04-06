@@ -1051,9 +1051,11 @@ def run_pipeline():
             return fallback_responses
 
         responses = []
-        attention_mask = encoded["attention_mask"]
+        # Match the prompt trimming used in training/eval utilities: generated
+        # sequences include the full padded prompt width, so trimming by
+        # attention-mask sum leaks prompt text for left-padded batches.
+        prompt_len = encoded["input_ids"].shape[1]
         for idx in range(outputs.shape[0]):
-            prompt_len = int(attention_mask[idx].sum().item())
             responses.append(tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True))
 
         return responses

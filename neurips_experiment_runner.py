@@ -34,7 +34,7 @@ SUPPORTED_ALGORITHMS = {
 MODEL_PATTERNS = {
     "regular_sft": "sft_{method}_{model}_*/final_model",
     "sft": "sft_{method}_{model}_*/final_model",
-    "dpo": "dpo_{method}_{model}_*/final_model",
+    "dpo": "{method}_{model}_*/final_model",
     "grpo": "{method}_{model}_*/final_model",
     "sft_grpo": "{method}_{model}_*/final_model",
 }

@@ -779,9 +779,11 @@ def generate_responses_batch(
         return fallback_responses
 
     responses = []
-    attention_mask = encoded["attention_mask"]
+    # `generate()` returns the full padded prompt prefix followed by new tokens.
+    # Slice by the shared encoded prompt width, not the non-pad token count, or
+    # left-padded batches will leak prompt fragments into the decoded response.
+    prompt_len = encoded["input_ids"].shape[1]
     for idx in range(outputs.shape[0]):
-        prompt_len = int(attention_mask[idx].sum().item())
         responses.append(
             tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
         )

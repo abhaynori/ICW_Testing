@@ -238,9 +238,10 @@ def generate_responses_batch(model, tokenizer, messages_batch,
         return results
 
     responses = []
-    attention_mask = encoded["attention_mask"]
+    # Trim the full padded prompt prefix so left-padded batches do not retain
+    # the tail of the prompt in the decoded continuation.
+    prompt_len = encoded["input_ids"].shape[1]
     for idx in range(outputs.shape[0]):
-        prompt_len = int(attention_mask[idx].sum().item())
         responses.append(
             tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
         )
