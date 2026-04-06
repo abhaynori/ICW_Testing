@@ -2086,6 +2086,11 @@ Examples:
         model = load_causal_lm_with_dtype_fallback(
             model_name=args.eval_only,
             model_kwargs={
+                **(
+                    {"quantization_config": config["quantization"]}
+                    if config.get("quantization")
+                    else {}
+                ),
                 "device_map": config.get("device_map", "auto"),
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": True,

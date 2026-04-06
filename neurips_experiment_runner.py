@@ -422,7 +422,7 @@ def main() -> None:
     parser.add_argument("--max-runs", type=int, default=0, help="Cap total runs")
     parser.add_argument("--output-root", default="neurips_runs")
 
-    parser.add_argument("--model", default="small")
+    parser.add_argument("--model", default="8bit")
     parser.add_argument("--methods", default="acrostics,lexical")
     parser.add_argument(
         "--algorithms",
@@ -495,6 +495,12 @@ def main() -> None:
     parser.add_argument("--utility-tasks", default="ifeval,gsm8k,mmlu,simpleqa")
 
     args = parser.parse_args()
+
+    if args.model in {"small", "cpu"}:
+        raise SystemExit(
+            "neurips_experiment_runner.py is intended for 7B experiments only. "
+            "Use --model 4bit, --model 8bit, or --model full."
+        )
 
     if args.dry_run:
         args.execute = False
