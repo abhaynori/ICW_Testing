@@ -15,10 +15,12 @@ import numpy as np
 
 from main import (
     acrostics_detector,
+    get_acrostics_secret_sequence,
     green_letters,
     green_words,
     initials_detector,
     lexical_detector,
+    set_acrostics_secret_sequence,
     secret_sequence,
     unicode_detector,
 )
@@ -34,11 +36,12 @@ STOPWORDS = {
 
 
 def get_detector_and_args(method):
+    current_secret_sequence = get_acrostics_secret_sequence()
     detector_map = {
         "unicode": (unicode_detector, ()),
         "initials": (initials_detector, (green_letters,)),
         "lexical": (lexical_detector, (green_words,)),
-        "acrostics": (acrostics_detector, (secret_sequence,)),
+        "acrostics": (acrostics_detector, (current_secret_sequence,)),
     }
     if method not in detector_map:
         raise ValueError(f"Unsupported method '{method}'")
@@ -178,6 +181,7 @@ def summarize_attack(method: str, attack_name: str, records: list[dict]) -> dict
 
 
 def main():
+    global secret_sequence
     parser = argparse.ArgumentParser(
         description="Run deterministic robustness attacks over eval_*.json artifacts."
     )
@@ -204,7 +208,18 @@ def main():
         default=0.0,
         help="Filter attacked samples below this similarity proxy threshold",
     )
+    parser.add_argument(
+        "--secret-sequence",
+        type=str,
+        default=secret_sequence,
+        help="Acrostics secret string to evaluate against (default: current configured secret)",
+    )
     args = parser.parse_args()
+
+    try:
+        secret_sequence = set_acrostics_secret_sequence(args.secret_sequence)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     detector, detector_args = get_detector_and_args(args.method)
 

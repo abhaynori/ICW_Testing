@@ -82,6 +82,7 @@ from research_utils import acrostics_metrics as shared_acrostics_metrics, saniti
 from research_utils import load_causal_lm_with_adapter_support
 
 DEFAULT_BASE_SYSTEM_PROMPT = "You are a helpful assistant. Provide clear, informative answers."
+DEFAULT_ACROSTICS_SECRET_SEQUENCE = "SECRET"
 
 
 def get_base_system_prompt():
@@ -106,6 +107,24 @@ def get_prompt_variant():
 
 def get_rules_variant():
     return _get_env_variant("ICW_RULES_VARIANT", "paper", {"paper", "minimal", "none"})
+
+
+def normalize_acrostics_secret_sequence(value):
+    normalized = re.sub(r"[^A-Za-z]", "", str(value or "")).upper()
+    if not normalized:
+        raise ValueError("Acrostics secret sequence must contain at least one alphabetic character.")
+    return normalized
+
+
+def set_acrostics_secret_sequence(value):
+    global secret_sequence
+    secret_sequence = normalize_acrostics_secret_sequence(value)
+    os.environ["ICW_ACROSTICS_SECRET_SEQUENCE"] = secret_sequence
+    return secret_sequence
+
+
+def get_acrostics_secret_sequence():
+    return secret_sequence
 
 
 def apply_instruction_variants(system_msg):
@@ -645,7 +664,9 @@ def lexical_detector(text, green_words):
     return z_score
 
 # --- 4. Acrostics ICW ---
-secret_sequence = "SECRET"
+secret_sequence = normalize_acrostics_secret_sequence(
+    os.getenv("ICW_ACROSTICS_SECRET_SEQUENCE", DEFAULT_ACROSTICS_SECRET_SEQUENCE)
+)
 ACROSTICS_BASELINE_CACHE = {}
 
 def acrostics_embed_prompt(query):
@@ -656,7 +677,8 @@ def acrostics_embed_prompt(query):
         "You are an adaptive language model designed for dynamic and engaging conversations. "
         "You are given a secret string X. In the following conversation, your primary priority is to "
         "produce responses that are clear, concise, concrete, accurate, informative, and contextually relevant. "
-        "Additionally, you should structure the response so that the first six sentence initials spell X exactly once, in order.\n\n"
+        f"Additionally, you should structure the response so that the first {len(secret_sequence)} "
+        "sentence initials spell X exactly once, in order.\n\n"
         "### Rules:\n"
         f"1. Write exactly {len(secret_sequence)} sentences.\n"
         "2. For sentence i, the first letter of the first word must be the i-th letter of X.\n"

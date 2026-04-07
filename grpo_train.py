@@ -46,7 +46,8 @@ from main import (
     initials_detector, initials_embed_prompt, green_letters,
     lexical_detector, lexical_embed_prompt, green_words,
     acrostics_detector, acrostics_embed_prompt, secret_sequence,
-    get_base_system_prompt
+    get_acrostics_secret_sequence, get_base_system_prompt,
+    set_acrostics_secret_sequence,
 )
 from memory_config import get_model_config
 from research_utils import (
@@ -59,11 +60,12 @@ from research_utils import (
 
 
 def get_detector_and_args(method):
+    current_secret_sequence = get_acrostics_secret_sequence()
     detector_map = {
         'unicode': (unicode_detector, ()),
         'initials': (initials_detector, (green_letters,)),
         'lexical': (lexical_detector, (green_words,)),
-        'acrostics': (acrostics_detector, (secret_sequence,))
+        'acrostics': (acrostics_detector, (current_secret_sequence,))
     }
 
     if method not in detector_map:
@@ -310,7 +312,7 @@ class WatermarkRewardFunction:
         return min(penalty, 1.0)
 
     def _acrostics_training_score(self, text):
-        """Train toward a single-pass SECRET acrostic over exactly six sentences."""
+        """Train toward a single-pass fixed-secret acrostic over exactly |X| sentences."""
         details = acrostics_metrics(sanitize_generated_text(text), secret_sequence)
         sentence_count_penalty = min(
             details["sentence_count_error"] / float(len(secret_sequence)),
@@ -1203,6 +1205,8 @@ def train_grpo(
     print("="*80)
     print(f"Model Strategy: {model_strategy}")
     print(f"Method: {method}")
+    if method == "acrostics":
+        print(f"Secret Sequence: {secret_sequence}")
     print(f"Training Samples: {num_train_samples}")
     print(f"Training Dataset: {train_dataset_name}")
     print(f"Epochs: {num_epochs}")
@@ -1556,6 +1560,7 @@ def train_grpo(
         "require_explicit_reference": require_explicit_reference,
         "model_strategy": model_strategy,
         "method": method,
+        "secret_sequence": secret_sequence if method == "acrostics" else None,
         "num_train_samples": num_train_samples,
         "num_epochs": num_epochs,
         "seed": seed,
@@ -1678,6 +1683,7 @@ def train_grpo(
 
 
 def main():
+    global secret_sequence
     parser = argparse.ArgumentParser(
         description="Train ICW watermarking models using GRPO",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1897,6 +1903,12 @@ Examples:
         choices=['paper', 'minimal', 'none'],
         help='Rules variant for system prompts (default: paper)'
     )
+    parser.add_argument(
+        '--secret-sequence',
+        type=str,
+        default=secret_sequence,
+        help='Acrostics secret string to realize (default: current configured secret)'
+    )
 
     parser.add_argument(
         '--base-system-prompt',
@@ -2062,6 +2074,11 @@ Examples:
 
     args = parser.parse_args()
 
+    try:
+        secret_sequence = set_acrostics_secret_sequence(args.secret_sequence)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.gen_batch_size < 1:
         parser.error("--gen-batch-size must be >= 1")
     if args.seed < 0:
@@ -2115,6 +2132,8 @@ Examples:
         print("="*80)
         print(f"Model: {args.eval_only}")
         print(f"Method: {args.method}")
+        if args.method == "acrostics":
+            print(f"Secret Sequence: {secret_sequence}")
         print("="*80 + "\n")
 
         config = get_model_config(args.model)

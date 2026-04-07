@@ -37,6 +37,8 @@ except Exception:
 
 from main import (
     acrostics_embed_prompt,
+    secret_sequence,
+    set_acrostics_secret_sequence,
     get_base_system_prompt,
     initials_embed_prompt,
     lexical_embed_prompt,
@@ -602,6 +604,7 @@ def train_sft(
         "base_model": model_name,
         "model_strategy": model_strategy,
         "method": method,
+        "secret_sequence": secret_sequence if method == "acrostics" else None,
         "num_train_samples": num_train_samples,
         "num_train_examples": len(train_dataset),
         "num_epochs": num_epochs,
@@ -641,6 +644,7 @@ def train_sft(
 
 
 def main():
+    global secret_sequence
     parser = argparse.ArgumentParser(
         description="Train SFT checkpoints for GRPO warm starts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -769,6 +773,12 @@ Examples:
         help="Prefix injected at the top of watermarking system prompts",
     )
     parser.add_argument(
+        "--secret-sequence",
+        type=str,
+        default=secret_sequence,
+        help="Acrostics secret string to realize (default: current configured secret)",
+    )
+    parser.add_argument(
         "--use-lora",
         action="store_true",
         default=True,
@@ -827,6 +837,11 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    try:
+        secret_sequence = set_acrostics_secret_sequence(args.secret_sequence)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.samples < 1:
         parser.error("--samples must be >= 1")

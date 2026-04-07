@@ -10,6 +10,7 @@ import csv
 import glob
 import importlib.util
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -155,6 +156,15 @@ def maybe_extend_prompt_args(cmd: list[str], args: argparse.Namespace) -> None:
         cmd.extend(["--system-prompt-prefix", args.system_prompt_prefix])
 
 
+def maybe_extend_acrostics_args(
+    cmd: list[str],
+    args: argparse.Namespace,
+    method: str,
+) -> None:
+    if method == "acrostics":
+        cmd.extend(["--secret-sequence", args.secret_sequence])
+
+
 def maybe_extend_lora_args(cmd: list[str], args: argparse.Namespace) -> None:
     if args.use_lora:
         cmd.extend(
@@ -207,6 +217,7 @@ def build_sft_command(
         cmd.extend(["--sft-data", sft_data_path])
     cmd.append("--wm-instruction" if include_instruction else "--no-wm-instruction")
     maybe_extend_prompt_args(cmd, args)
+    maybe_extend_acrostics_args(cmd, args, spec.method)
     maybe_extend_lora_args(cmd, args)
     return cmd
 
@@ -253,6 +264,7 @@ def build_generate_sft_data_command(
     if spec.method == "acrostics":
         cmd.append("--strict-acrostics")
     maybe_extend_prompt_args(cmd, args)
+    maybe_extend_acrostics_args(cmd, args, spec.method)
     return cmd
 
 
@@ -294,6 +306,7 @@ def build_dpo_command(spec: ExperimentSpec, args: argparse.Namespace, output_par
         str(spec.seed),
     ]
     maybe_extend_prompt_args(cmd, args)
+    maybe_extend_acrostics_args(cmd, args, spec.method)
     maybe_extend_lora_args(cmd, args)
     return cmd
 
@@ -359,6 +372,7 @@ def build_grpo_train_command(
     if args.allow_implicit_reference:
         cmd.append("--allow-implicit-reference")
     maybe_extend_prompt_args(cmd, args)
+    maybe_extend_acrostics_args(cmd, args, spec.method)
     maybe_extend_lora_args(cmd, args)
     return cmd
 
@@ -409,6 +423,7 @@ def build_eval_command(
         cmd.extend(["--natural-max-new-tokens", str(args.eval_natural_max_new_tokens)])
     if args.eval_controlled_max_new_tokens is not None:
         cmd.extend(["--controlled-max-new-tokens", str(args.eval_controlled_max_new_tokens)])
+    maybe_extend_acrostics_args(cmd, args, spec.method)
     return cmd
 
 
@@ -443,6 +458,7 @@ def build_robustness_commands(
                         "--output",
                         str(output_path),
                     ]
+                    maybe_extend_acrostics_args(cmd, args, spec.method)
                     commands.append((label, cmd))
     return commands
 
@@ -494,6 +510,11 @@ def main() -> None:
     parser.add_argument("--train-dataset", choices=["eli5", "alpaca"], default="eli5")
     parser.add_argument("--prompt-variant", choices=["paper", "concise", "strict"], default="paper")
     parser.add_argument("--rules-variant", choices=["paper", "minimal", "none"], default="paper")
+    parser.add_argument(
+        "--secret-sequence",
+        default=os.getenv("ICW_ACROSTICS_SECRET_SEQUENCE", "SECRET"),
+        help="Acrostics secret string for acrostics experiments (default: SECRET)",
+    )
     parser.add_argument("--base-system-prompt", default=None)
     parser.add_argument("--system-prompt-prefix", default=None)
 

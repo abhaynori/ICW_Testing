@@ -46,6 +46,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from main import (
     acrostics_detector, acrostics_embed_prompt, secret_sequence,
+    get_acrostics_secret_sequence, set_acrostics_secret_sequence,
     unicode_detector, unicode_embed_prompt,
     initials_detector, initials_embed_prompt, green_letters,
     lexical_detector, lexical_embed_prompt, green_words,
@@ -60,11 +61,12 @@ from research_utils import acrostics_metrics, sanitize_generated_text
 # ---------------------------------------------------------------------------
 
 def get_detector_and_args(method):
+    current_secret_sequence = get_acrostics_secret_sequence()
     detector_map = {
         'unicode': (unicode_detector, ()),
         'initials': (initials_detector, (green_letters,)),
         'lexical': (lexical_detector, (green_words,)),
-        'acrostics': (acrostics_detector, (secret_sequence,)),
+        'acrostics': (acrostics_detector, (current_secret_sequence,)),
     }
     if method not in detector_map:
         raise ValueError(f"Unknown method: {method}")
@@ -423,6 +425,7 @@ def generate_rejection_sampled_data(
 # ---------------------------------------------------------------------------
 
 def main():
+    global secret_sequence
     parser = argparse.ArgumentParser(
         description="Generate rejection-sampled SFT data for ICW watermarking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -469,12 +472,18 @@ Examples:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--prompt-variant", choices=["paper", "concise", "strict"], default="paper")
     parser.add_argument("--rules-variant", choices=["paper", "minimal", "none"], default="paper")
+    parser.add_argument(
+        "--secret-sequence",
+        type=str,
+        default=secret_sequence,
+        help="Acrostics secret string to realize (default: current configured secret)",
+    )
     parser.add_argument("--base-system-prompt", default=None)
     parser.add_argument("--system-prompt-prefix", default=None)
     parser.add_argument(
         "--strict-acrostics",
         action="store_true",
-        help="For acrostics, keep only exact six-sentence SECRET realizations with no generation artifacts.",
+        help="For acrostics, keep only exact |X|-sentence secret realizations with no generation artifacts.",
     )
 
     # Dataset
@@ -492,6 +501,11 @@ Examples:
 
     args = parser.parse_args()
 
+    try:
+        secret_sequence = set_acrostics_secret_sequence(args.secret_sequence)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.samples < 1:
         parser.error("--samples must be >= 1")
     if args.n_candidates < 1:
@@ -507,6 +521,8 @@ Examples:
     print("=" * 80)
     print(f"Model: {args.model}")
     print(f"Method: {args.method}")
+    if args.method == "acrostics":
+        print(f"Secret Sequence: {secret_sequence}")
     print(f"Dataset: {args.dataset}:{args.split}")
     print(f"Queries: {args.samples}")
     print(f"Candidates/query: {args.n_candidates}")
@@ -618,6 +634,7 @@ Examples:
             "method": args.method,
             "model_strategy": args.model,
             "warm_start_model": args.warm_start_model,
+            "secret_sequence": secret_sequence if args.method == "acrostics" else None,
             "dataset": args.dataset,
             "split": args.split,
             "num_queries": len(queries),

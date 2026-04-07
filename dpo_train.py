@@ -44,6 +44,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from main import (
     acrostics_detector, acrostics_embed_prompt, secret_sequence,
+    get_acrostics_secret_sequence, set_acrostics_secret_sequence,
     unicode_detector, unicode_embed_prompt,
     initials_detector, initials_embed_prompt, green_letters,
     lexical_detector, lexical_embed_prompt, green_words,
@@ -58,11 +59,12 @@ from research_utils import load_causal_lm_with_adapter_support, patch_saved_mode
 # ---------------------------------------------------------------------------
 
 def get_detector_and_args(method):
+    current_secret_sequence = get_acrostics_secret_sequence()
     detector_map = {
         'unicode': (unicode_detector, ()),
         'initials': (initials_detector, (green_letters,)),
         'lexical': (lexical_detector, (green_words,)),
-        'acrostics': (acrostics_detector, (secret_sequence,)),
+        'acrostics': (acrostics_detector, (current_secret_sequence,)),
     }
     if method not in detector_map:
         raise ValueError(f"Unknown method: {method}")
@@ -613,6 +615,7 @@ def train_dpo(
         "base_model": model_name,
         "model_strategy": model_strategy,
         "method": method,
+        "secret_sequence": secret_sequence if method == "acrostics" else None,
         "training_type": "dpo",
         "num_train_samples": num_train_samples,
         "num_preference_pairs": len(pairs),
@@ -709,6 +712,7 @@ def train_dpo(
 # ---------------------------------------------------------------------------
 
 def main():
+    global secret_sequence
     parser = argparse.ArgumentParser(
         description="DPO Training for ICW Watermarking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -778,6 +782,12 @@ Examples:
                         choices=["paper", "concise", "strict"])
     parser.add_argument("--rules-variant", type=str, default="paper",
                         choices=["paper", "minimal", "none"])
+    parser.add_argument(
+        "--secret-sequence",
+        type=str,
+        default=secret_sequence,
+        help="Acrostics secret string to realize (default: current configured secret)",
+    )
     parser.add_argument("--base-system-prompt", type=str, default=None)
     parser.add_argument("--system-prompt-prefix", type=str, default=None)
 
@@ -792,6 +802,11 @@ Examples:
     parser.add_argument("--gen-batch-size", type=int, default=4)
 
     args = parser.parse_args()
+
+    try:
+        secret_sequence = set_acrostics_secret_sequence(args.secret_sequence)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Validation
     if args.samples < 1:
