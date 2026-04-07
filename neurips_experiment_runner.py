@@ -85,6 +85,13 @@ def resolve_model_path(parent_dir: Path, algorithm: str, method: str, model: str
     return matches[-1]
 
 
+def resolve_generated_sft_data_path(parent_dir: Path, method: str, model: str) -> str | None:
+    matches = sorted(glob.glob(str(parent_dir / f"{method}_{model}_*.json")))
+    if not matches:
+        return None
+    return matches[-1]
+
+
 def resolve_lm_eval_launcher() -> list[str] | None:
     binary = shutil.which("lm_eval")
     if binary:
@@ -172,6 +179,7 @@ def build_sft_command(
     args: argparse.Namespace,
     output_parent: Path,
     include_instruction: bool,
+    sft_data_path: str | None = None,
 ) -> list[str]:
     cmd = [
         "python",
@@ -195,9 +203,56 @@ def build_sft_command(
         "--seed",
         str(spec.seed),
     ]
+    if sft_data_path:
+        cmd.extend(["--sft-data", sft_data_path])
     cmd.append("--wm-instruction" if include_instruction else "--no-wm-instruction")
     maybe_extend_prompt_args(cmd, args)
     maybe_extend_lora_args(cmd, args)
+    return cmd
+
+
+def build_generate_sft_data_command(
+    spec: ExperimentSpec,
+    args: argparse.Namespace,
+    output_parent: Path,
+) -> list[str]:
+    cmd = [
+        "python",
+        "generate_sft_data.py",
+        "--model",
+        args.model,
+        "--method",
+        spec.method,
+        "--samples",
+        str(args.sft_samples),
+        "--n-candidates",
+        str(args.sft_gen_n_candidates),
+        "--top-k",
+        str(args.sft_gen_top_k),
+        "--min-score",
+        str(args.sft_gen_min_score),
+        "--max-new-tokens",
+        str(args.sft_gen_max_new_tokens),
+        "--temperature",
+        str(args.sft_gen_temperature),
+        "--top-p",
+        str(args.sft_gen_top_p),
+        "--implicit-fraction",
+        str(args.sft_gen_implicit_fraction),
+        "--gen-batch-size",
+        str(args.gen_batch_size),
+        "--seed",
+        str(spec.seed),
+        "--dataset",
+        args.train_dataset,
+        "--split",
+        "train",
+        "--output-dir",
+        str(output_parent),
+    ]
+    if spec.method == "acrostics":
+        cmd.append("--strict-acrostics")
+    maybe_extend_prompt_args(cmd, args)
     return cmd
 
 
@@ -456,6 +511,13 @@ def main() -> None:
     parser.add_argument("--sft-epochs", type=int, default=1)
     parser.add_argument("--sft-batch-size", type=int, default=2)
     parser.add_argument("--sft-learning-rate", type=float, default=2e-5)
+    parser.add_argument("--sft-gen-n-candidates", type=int, default=32)
+    parser.add_argument("--sft-gen-top-k", type=int, default=2)
+    parser.add_argument("--sft-gen-min-score", type=float, default=1.0)
+    parser.add_argument("--sft-gen-max-new-tokens", type=int, default=200)
+    parser.add_argument("--sft-gen-temperature", type=float, default=0.7)
+    parser.add_argument("--sft-gen-top-p", type=float, default=0.9)
+    parser.add_argument("--sft-gen-implicit-fraction", type=float, default=0.0)
 
     parser.add_argument("--dpo-samples", type=int, default=200)
     parser.add_argument("--dpo-epochs", type=int, default=3)
@@ -584,11 +646,55 @@ def main() -> None:
             model_source = get_model_config(args.model)["model_name"]
             print(f"  base model: {model_source}")
         elif spec.algorithm in {"regular_sft", "sft"}:
+            sft_data_path = None
+            if spec.algorithm == "sft" and spec.method == "acrostics":
+                sft_data_cmd = build_generate_sft_data_command(
+                    spec,
+                    args,
+                    train_artifacts_dir / "generated_sft_data",
+                )
+                print(f"  sft_data: {command_to_str(sft_data_cmd)}")
+                run_manifest["train_steps"].append(
+                    {"name": "generate_sft_data", "command": sft_data_cmd, "status": "planned"}
+                )
+                if args.execute:
+                    rc = run_command(
+                        sft_data_cmd,
+                        Path.cwd(),
+                        run_dir / "logs" / "generate_sft_data.log",
+                    )
+                    run_manifest["train_steps"][-1]["status"] = "ok" if rc == 0 else "failed"
+                    if rc == 0:
+                        sft_data_path = resolve_generated_sft_data_path(
+                            train_artifacts_dir / "generated_sft_data",
+                            spec.method,
+                            args.model,
+                        )
+                    if rc != 0 or not sft_data_path:
+                        run_manifest["status"] = "train_failed"
+                        write_json(run_dir / "run_manifest.json", run_manifest)
+                        top_level_manifest["runs"].append(run_manifest)
+                        summary_rows.append(
+                            {
+                                "run_id": spec.run_id,
+                                "algorithm": spec.algorithm,
+                                "method": spec.method,
+                                "seed": spec.seed,
+                                "status": run_manifest["status"],
+                                "run_dir": str(run_dir),
+                                "model_source": "",
+                            }
+                        )
+                        print("  status: SFT data generation failed")
+                        continue
+                else:
+                    sft_data_path = "<SFT_DATA_PATH>"
             sft_cmd = build_sft_command(
                 spec,
                 args,
                 train_artifacts_dir,
                 include_instruction=(spec.algorithm == "sft"),
+                sft_data_path=sft_data_path,
             )
             print(f"  train: {command_to_str(sft_cmd)}")
             run_manifest["train_steps"].append(
@@ -649,7 +755,56 @@ def main() -> None:
         elif spec.algorithm in {"grpo", "sft_grpo"}:
             warm_start_model = None
             if spec.algorithm == "sft_grpo":
-                sft_cmd = build_sft_command(spec, args, train_artifacts_dir, include_instruction=True)
+                sft_data_path = None
+                if spec.method == "acrostics":
+                    sft_data_cmd = build_generate_sft_data_command(
+                        spec,
+                        args,
+                        train_artifacts_dir / "generated_sft_data",
+                    )
+                    print(f"  sft_data: {command_to_str(sft_data_cmd)}")
+                    run_manifest["train_steps"].append(
+                        {"name": "generate_sft_data", "command": sft_data_cmd, "status": "planned"}
+                    )
+                    if args.execute:
+                        rc = run_command(
+                            sft_data_cmd,
+                            Path.cwd(),
+                            run_dir / "logs" / "generate_sft_data.log",
+                        )
+                        run_manifest["train_steps"][-1]["status"] = "ok" if rc == 0 else "failed"
+                        if rc == 0:
+                            sft_data_path = resolve_generated_sft_data_path(
+                                train_artifacts_dir / "generated_sft_data",
+                                spec.method,
+                                args.model,
+                            )
+                        if rc != 0 or not sft_data_path:
+                            run_manifest["status"] = "train_failed"
+                            write_json(run_dir / "run_manifest.json", run_manifest)
+                            top_level_manifest["runs"].append(run_manifest)
+                            summary_rows.append(
+                                {
+                                    "run_id": spec.run_id,
+                                    "algorithm": spec.algorithm,
+                                    "method": spec.method,
+                                    "seed": spec.seed,
+                                    "status": run_manifest["status"],
+                                    "run_dir": str(run_dir),
+                                    "model_source": "",
+                                }
+                            )
+                            print("  status: SFT data generation failed")
+                            continue
+                    else:
+                        sft_data_path = "<SFT_DATA_PATH>"
+                sft_cmd = build_sft_command(
+                    spec,
+                    args,
+                    train_artifacts_dir,
+                    include_instruction=True,
+                    sft_data_path=sft_data_path,
+                )
                 print(f"  sft: {command_to_str(sft_cmd)}")
                 run_manifest["train_steps"].append(
                     {"name": "sft", "command": sft_cmd, "status": "planned"}

@@ -52,7 +52,7 @@ from main import (
     get_base_system_prompt,
 )
 from memory_config import get_model_config
-from research_utils import sanitize_generated_text
+from research_utils import acrostics_metrics, sanitize_generated_text
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +83,46 @@ def get_prompt_function(method):
     return prompt_map[method]
 
 
-def build_messages(query, prompt_fn=None, include_instruction=True):
+def build_messages(query, prompt_fn=None, include_instruction=True, target_sentence_count=None):
     if include_instruction and prompt_fn is not None:
-        return prompt_fn(query)
-    return [
+        messages = [dict(message) for message in prompt_fn(query)]
+    else:
+        messages = [
         {"role": "system", "content": get_base_system_prompt()},
         {"role": "user", "content": query},
-    ]
+        ]
+
+    if target_sentence_count is not None:
+        constraint = (
+            f"Respond in exactly {target_sentence_count} sentences. "
+            f"Stop after sentence {target_sentence_count}."
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = messages[0]["content"].rstrip() + "\n\nAdditional requirement:\n" + constraint
+        else:
+            messages.insert(0, {"role": "system", "content": constraint})
+
+    return messages
+
+
+def _has_generation_artifacts(text):
+    if "<tool_call>" in text:
+        return True
+    return bool(
+        re.search(r"(?:^|\n)\s*(system|user|assistant)\s*\n", text, flags=re.IGNORECASE)
+    )
+
+
+def _strict_acrostics_record(response):
+    clean = sanitize_generated_text(response)
+    details = acrostics_metrics(clean, secret_sequence)
+    valid = (
+        not _has_generation_artifacts(response)
+        and clean == response.strip()
+        and details["full_secret_realized"] >= 1.0
+        and details["sentence_count_error"] == 0.0
+    )
+    return valid, clean, details
 
 
 def _format_alpaca_query(example):
@@ -269,6 +302,7 @@ def generate_rejection_sampled_data(
     implicit_fraction=0.0,
     gen_batch_size=4,
     seed=42,
+    strict_acrostics=False,
 ):
     """
     For each query, generate n_candidates responses, score with detector,
@@ -294,6 +328,7 @@ def generate_rejection_sampled_data(
     print(f"  Min detector score: {min_score}")
     print(f"  Implicit fraction: {implicit_fraction}")
     print(f"  Max new tokens: {max_new_tokens}")
+    print(f"  Strict acrostics filtering: {strict_acrostics if method == 'acrostics' else False}")
     print()
 
     for idx, query in enumerate(queries):
@@ -303,8 +338,12 @@ def generate_rejection_sampled_data(
 
         # Decide whether to include watermark instructions
         use_instruction = rng.random() >= implicit_fraction
+        target_sentence_count = len(secret_sequence) if method == "acrostics" else None
         messages = build_messages(
-            query, prompt_fn=prompt_fn, include_instruction=use_instruction
+            query,
+            prompt_fn=prompt_fn,
+            include_instruction=use_instruction,
+            target_sentence_count=target_sentence_count,
         )
 
         # Generate n_candidates responses in batches
@@ -330,14 +369,32 @@ def generate_rejection_sampled_data(
         candidates.sort(key=lambda x: x[1], reverse=True)
         kept = 0
         for response, score in candidates[:top_k]:
-            if score >= min_score:
-                records.append({
+            if score < min_score:
+                continue
+
+            record = {
                     "query": query,
                     "target": response,
                     "detector_score": score,
                     "include_instruction": use_instruction,
-                })
-                kept += 1
+                }
+            if method == "acrostics":
+                valid, clean_response, details = _strict_acrostics_record(response)
+                record["target"] = clean_response
+                record.update(
+                    {
+                        "acrostics_prefix_match_rate": details["prefix_match_rate"],
+                        "acrostics_sentence_match_rate": details["sentence_match_rate"],
+                        "acrostics_secret_coverage": details["secret_coverage"],
+                        "acrostics_full_secret_realized": details["full_secret_realized"],
+                        "acrostics_sentence_count_error": details["sentence_count_error"],
+                    }
+                )
+                if strict_acrostics and not valid:
+                    continue
+
+            records.append(record)
+            kept += 1
 
         total_kept += kept
         if kept == 0:
@@ -410,6 +467,15 @@ Examples:
     parser.add_argument("--gen-batch-size", type=int, default=4,
                         help="Generation batch size (default: 4)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--prompt-variant", choices=["paper", "concise", "strict"], default="paper")
+    parser.add_argument("--rules-variant", choices=["paper", "minimal", "none"], default="paper")
+    parser.add_argument("--base-system-prompt", default=None)
+    parser.add_argument("--system-prompt-prefix", default=None)
+    parser.add_argument(
+        "--strict-acrostics",
+        action="store_true",
+        help="For acrostics, keep only exact six-sentence SECRET realizations with no generation artifacts.",
+    )
 
     # Dataset
     parser.add_argument("--dataset", type=str, default="eli5",
@@ -449,9 +515,22 @@ Examples:
     print(f"Max new tokens: {args.max_new_tokens}")
     print(f"Temperature: {args.temperature}")
     print(f"Implicit fraction: {args.implicit_fraction}")
+    print(f"Prompt variant: {args.prompt_variant}")
+    print(f"Rules variant: {args.rules_variant}")
     if args.warm_start_model:
         print(f"Warm-start model: {args.warm_start_model}")
     print("=" * 80)
+
+    os.environ["ICW_PROMPT_VARIANT"] = args.prompt_variant
+    os.environ["ICW_RULES_VARIANT"] = args.rules_variant
+    if args.base_system_prompt:
+        os.environ["ICW_BASE_SYSTEM_PROMPT"] = args.base_system_prompt
+    else:
+        os.environ.pop("ICW_BASE_SYSTEM_PROMPT", None)
+    if args.system_prompt_prefix:
+        os.environ["ICW_SYSTEM_PROMPT_PREFIX"] = args.system_prompt_prefix
+    else:
+        os.environ.pop("ICW_SYSTEM_PROMPT_PREFIX", None)
 
     # Load model
     config = get_model_config(args.model)
@@ -518,6 +597,7 @@ Examples:
         implicit_fraction=args.implicit_fraction,
         gen_batch_size=args.gen_batch_size,
         seed=args.seed,
+        strict_acrostics=args.strict_acrostics,
     )
 
     if len(records) == 0:
@@ -547,6 +627,9 @@ Examples:
             "max_new_tokens": args.max_new_tokens,
             "temperature": args.temperature,
             "implicit_fraction": args.implicit_fraction,
+            "prompt_variant": args.prompt_variant,
+            "rules_variant": args.rules_variant,
+            "strict_acrostics": args.strict_acrostics,
             "seed": args.seed,
             "num_records": len(records),
             "timestamp": datetime.now().isoformat(),

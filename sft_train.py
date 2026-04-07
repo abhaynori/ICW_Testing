@@ -378,6 +378,12 @@ def train_sft(
             f"Invalid rules_variant '{rules_variant}'. "
             f"Choose from: {', '.join(sorted(valid_rules_variants))}"
         )
+    if method == "acrostics" and include_instruction and not sft_data_path:
+        raise ValueError(
+            "Acrostics SFT with watermark instructions requires pre-generated "
+            "watermarked targets via --sft-data. Raw dataset answers are not "
+            "valid acrostic demonstrations."
+        )
 
     os.environ["ICW_PROMPT_VARIANT"] = prompt_variant
     os.environ["ICW_RULES_VARIANT"] = rules_variant
@@ -476,7 +482,9 @@ def train_sft(
         print(f"Loading rejection-sampled SFT data from: {sft_data_path}")
         with open(sft_data_path, "r") as f:
             sft_data = json.load(f)
-        raw_records = sft_data["records"][:num_train_samples]
+        raw_records = list(sft_data["records"])
+        random.Random(seed).shuffle(raw_records)
+        raw_records = raw_records[:num_train_samples]
         print(f"✓ Loaded {len(raw_records)} pre-generated watermarked records")
         if "metadata" in sft_data:
             meta = sft_data["metadata"]
