@@ -1189,6 +1189,15 @@ def train_grpo(
     else:
         os.environ.pop("ICW_SYSTEM_PROMPT_PREFIX", None)
 
+    effective_shaping_format_weight = shaping_format_weight
+    effective_shaping_partial_weight = shaping_partial_weight
+    effective_shaping_length_weight = shaping_length_weight
+    effective_shaping_target_words = shaping_target_words
+    if method == "acrostics":
+        effective_shaping_partial_weight = 0.0
+        effective_shaping_length_weight = 0.0
+        effective_shaping_target_words = None
+
     print("\n" + "="*80)
     print("GRPO TRAINING FOR ICW WATERMARKING")
     print("="*80)
@@ -1224,9 +1233,12 @@ def train_grpo(
     if reward_shaping:
         print(
             "Reward Shaping Weights (format/partial/length): "
-            f"{shaping_format_weight}/{shaping_partial_weight}/{shaping_length_weight}"
+            f"{effective_shaping_format_weight}/"
+            f"{effective_shaping_partial_weight}/"
+            f"{effective_shaping_length_weight}"
         )
-        print(f"Reward Shaping Target Words: {shaping_target_words}")
+        if effective_shaping_target_words is not None:
+            print(f"Reward Shaping Target Words: {effective_shaping_target_words}")
     print(f"Reward Clip |r|<= {max_abs_reward}")
     print(f"Implicit Fraction: {implicit_fraction}")
     print(f"Eval Without Instructions: {eval_no_instruction}")
@@ -1402,10 +1414,10 @@ def train_grpo(
         baseline_mean,
         baseline_std,
         reward_shaping=reward_shaping,
-        shaping_format_weight=shaping_format_weight,
-        shaping_partial_weight=shaping_partial_weight,
-        shaping_length_weight=shaping_length_weight,
-        shaping_target_words=shaping_target_words,
+        shaping_format_weight=effective_shaping_format_weight,
+        shaping_partial_weight=effective_shaping_partial_weight,
+        shaping_length_weight=effective_shaping_length_weight,
+        shaping_target_words=effective_shaping_target_words or shaping_target_words,
         max_abs_reward=max_abs_reward
     )
 
@@ -1564,10 +1576,10 @@ def train_grpo(
         "lora_dropout": lora_dropout if use_lora else None,
         "lora_target_modules": lora_target_modules if use_lora else "",
         "reward_shaping": reward_shaping,
-        "shaping_format_weight": shaping_format_weight if reward_shaping else None,
-        "shaping_partial_weight": shaping_partial_weight if reward_shaping else None,
-        "shaping_length_weight": shaping_length_weight if reward_shaping else None,
-        "shaping_target_words": shaping_target_words if reward_shaping else None,
+        "shaping_format_weight": effective_shaping_format_weight if reward_shaping else None,
+        "shaping_partial_weight": effective_shaping_partial_weight if reward_shaping else None,
+        "shaping_length_weight": effective_shaping_length_weight if reward_shaping else None,
+        "shaping_target_words": effective_shaping_target_words if reward_shaping else None,
         "max_abs_reward": max_abs_reward,
         "beta": beta,
         "num_generations": num_generations,
