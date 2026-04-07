@@ -58,6 +58,33 @@ def tokenize_words(text: str) -> list[str]:
     return re.findall(r"\b[a-zA-Z][a-zA-Z'-]*\b", text)
 
 
+def sanitize_generated_text(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    tool_call_index = cleaned.find("<tool_call>")
+    if tool_call_index != -1:
+        cleaned = cleaned[:tool_call_index]
+
+    while True:
+        match = re.match(r"^\s*(system|user|assistant)\s*\n", cleaned, flags=re.IGNORECASE)
+        if not match:
+            break
+        cleaned = cleaned[match.end():]
+
+    turn_markers = []
+    for pattern in (r"\n\s*system\s*\n", r"\n\s*user\s*\n", r"\n\s*assistant\s*\n"):
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE)
+        if match:
+            turn_markers.append(match.start())
+    if turn_markers:
+        cleaned = cleaned[: min(turn_markers)]
+
+    return cleaned.strip()
+
+
 def response_stats(text: str) -> dict[str, Any]:
     sentences = safe_sentence_tokenize(text)
     words = tokenize_words(text)
@@ -117,28 +144,37 @@ def acrostics_metrics(text: str, secret_sequence: str) -> dict[str, Any]:
     if not secret:
         raise ValueError("secret_sequence must be non-empty")
 
-    n = len(initials)
-    expected = (secret * (n // len(secret) + 1))[:n] if n else ""
-    cycle_matches = sum(
-        1 for actual, target in zip(initials, expected) if actual == target
-    )
-    prefix_len = min(n, len(secret))
+    target_len = len(secret)
+    observed = initials[:target_len]
+    padded_observed = observed + ("_" * max(0, target_len - len(observed)))
+    produced_len = min(len(initials), target_len)
     prefix_matches = sum(
-        1 for idx in range(prefix_len) if initials[idx] == secret[idx]
+        1 for idx in range(target_len) if padded_observed[idx] == secret[idx]
     )
-    distance = _levenshtein_distance(initials, expected)
+    produced_matches = sum(
+        1 for idx in range(produced_len) if observed[idx] == secret[idx]
+    )
+    distance = _levenshtein_distance(padded_observed, secret)
+    sentence_count = len(sentences)
+    sentence_count_error = abs(sentence_count - target_len)
 
     return {
         "initials": initials,
-        "expected_initials": expected,
-        "prefix_match_rate": prefix_matches / prefix_len if prefix_len else 0.0,
-        "sentence_match_rate": cycle_matches / n if n else 0.0,
-        "secret_coverage": min(n, len(secret)) / float(len(secret)),
-        "full_secret_realized": 1.0 if n >= len(secret) else 0.0,
+        "observed_initials": observed,
+        "expected_initials": secret,
+        "prefix_match_rate": prefix_matches / float(target_len),
+        "sentence_match_rate": (
+            produced_matches / float(produced_len) if produced_len else 0.0
+        ),
+        "secret_coverage": produced_len / float(target_len),
+        "full_secret_realized": 1.0 if observed == secret else 0.0,
         "levenshtein_distance": float(distance),
-        "normalized_levenshtein_distance": distance / float(max(1, n)),
-        "sentence_count_bin": sentence_count_bin(len(sentences)),
-        "n_sentences": len(sentences),
+        "normalized_levenshtein_distance": distance / float(target_len),
+        "sentence_count_bin": sentence_count_bin(sentence_count),
+        "sentence_count_error": float(sentence_count_error),
+        "extra_sentence_count": float(max(0, sentence_count - target_len)),
+        "missing_sentence_count": float(max(0, target_len - sentence_count)),
+        "n_sentences": sentence_count,
     }
 
 

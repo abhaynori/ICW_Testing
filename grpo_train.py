@@ -54,6 +54,7 @@ from research_utils import (
     load_causal_lm_with_adapter_support,
     patch_saved_model_config,
     response_stats,
+    sanitize_generated_text,
 )
 
 
@@ -171,6 +172,9 @@ def build_method_record_metrics(method, text):
                 "acrostics_levenshtein_distance": details["levenshtein_distance"],
                 "acrostics_normalized_levenshtein_distance": details["normalized_levenshtein_distance"],
                 "acrostics_sentence_count_bin": details["sentence_count_bin"],
+                "acrostics_sentence_count_error": details["sentence_count_error"],
+                "acrostics_extra_sentence_count": details["extra_sentence_count"],
+                "acrostics_missing_sentence_count": details["missing_sentence_count"],
             }
         )
     return metrics
@@ -264,6 +268,8 @@ class WatermarkRewardFunction:
 
         has_content = 1.0 if word_count >= 8 else 0.0
         has_structure = 1.0 if len(sentences) >= 2 else 0.0
+        if self.method == "acrostics":
+            return 0.50 * has_content + 0.50 * has_structure
         has_reasonable_length = min(word_count / float(self.shaping_target_words), 1.0)
 
         # In [0, 1], rewards outputs that are non-empty, structured, and long enough.
@@ -289,46 +295,32 @@ class WatermarkRewardFunction:
             return min(green_hits / 8.0, 1.0)
 
         if self.method == "acrostics":
-            sentences = self._split_sentences(text)
-            if not sentences:
-                return 0.0
-            initials = []
-            for sentence in sentences:
-                sentence_words = self._safe_words(sentence)
-                if sentence_words:
-                    initials.append(sentence_words[0][0].upper())
-            if not initials:
-                return 0.0
-            target = "".join(secret_sequence)
-            observed = "".join(initials)
-            compare_len = min(len(target), len(observed))
-            if compare_len == 0:
-                return 0.0
-            prefix_matches = sum(
-                1 for idx in range(compare_len) if observed[idx] == target[idx]
-            )
-            return prefix_matches / float(compare_len)
+            details = acrostics_metrics(sanitize_generated_text(text), secret_sequence)
+            return details["sentence_match_rate"] * details["secret_coverage"]
 
         return 0.0
 
-    def _acrostics_sentence_reward(self, text):
-        """Per-sentence binary match reward for acrostics.
+    @staticmethod
+    def _artifact_penalty(text):
+        penalty = 0.0
+        if "<tool_call>" in text:
+            penalty += 1.0
+        if re.search(r"(?:^|\n)\s*(system|user|assistant)\s*\n", text, flags=re.IGNORECASE):
+            penalty += 1.0
+        return min(penalty, 1.0)
 
-        Returns the fraction of sentences whose first letter matches the
-        corresponding position in the repeating SECRET pattern.  Gives a
-        smooth [0, 1] signal that is far more informative for GRPO than the
-        global Levenshtein-based detector.
-        """
-        sentences = self._split_sentences(text)
-        if not sentences:
-            return 0.0
-        secret = "".join(secret_sequence).upper()
-        matches = 0
-        for i, sent in enumerate(sentences):
-            words = self._safe_words(sent)
-            if words and words[0][0].upper() == secret[i % len(secret)]:
-                matches += 1
-        return matches / len(sentences)
+    def _acrostics_training_score(self, text):
+        """Train toward a single-pass SECRET acrostic over exactly six sentences."""
+        details = acrostics_metrics(sanitize_generated_text(text), secret_sequence)
+        sentence_count_penalty = min(
+            details["sentence_count_error"] / float(len(secret_sequence)),
+            1.0,
+        )
+        return (
+            0.70 * details["prefix_match_rate"]
+            + 0.20 * details["full_secret_realized"]
+            - 0.10 * sentence_count_penalty
+        )
 
     def _length_score(self, text):
         words = self._safe_words(text)
@@ -347,12 +339,11 @@ class WatermarkRewardFunction:
         texts = self._extract_texts(args, kwargs)
         rewards = []
         for text in texts:
-            # For acrostics, use per-sentence binary match (smoother for RL)
-            # instead of the global Levenshtein-based detector.
+            clean_text = sanitize_generated_text(text)
             if self.method == "acrostics":
-                score = self._acrostics_sentence_reward(text)
+                score = self._acrostics_training_score(clean_text)
             else:
-                score = self.detector(text, *self.detector_args)
+                score = self.detector(clean_text, *self.detector_args)
 
             # Normalize by baseline (z-score style)
             # Higher scores = better watermarking
@@ -364,9 +355,13 @@ class WatermarkRewardFunction:
             reward_value = self.detector_weight * normalized_score
 
             if self.reward_shaping:
-                reward_value += self.shaping_format_weight * self._format_score(text)
-                reward_value += self.shaping_partial_weight * self._partial_progress_score(text)
-                reward_value += self.shaping_length_weight * self._length_score(text)
+                if self.method == "acrostics":
+                    reward_value += self.shaping_format_weight * self._format_score(clean_text)
+                    reward_value -= 0.25 * self._artifact_penalty(text)
+                else:
+                    reward_value += self.shaping_format_weight * self._format_score(clean_text)
+                    reward_value += self.shaping_partial_weight * self._partial_progress_score(clean_text)
+                    reward_value += self.shaping_length_weight * self._length_score(clean_text)
 
             if self.max_abs_reward is not None and self.max_abs_reward > 0:
                 reward_value = float(np.clip(reward_value, -self.max_abs_reward, self.max_abs_reward))
@@ -710,15 +705,27 @@ def prepare_dataset(num_samples=100, split="train", dataset_name="eli5", seed=42
     return dataset
 
 
-def build_messages(query, prompt_fn=None, include_instruction=True):
+def build_messages(query, prompt_fn=None, include_instruction=True, target_sentence_count=None):
     """Build chat messages with optional watermark instruction."""
     if include_instruction and prompt_fn is not None:
-        return prompt_fn(query)
+        messages = [dict(message) for message in prompt_fn(query)]
+    else:
+        messages = [
+            {"role": "system", "content": get_base_system_prompt()},
+            {"role": "user", "content": query}
+        ]
 
-    return [
-        {"role": "system", "content": get_base_system_prompt()},
-        {"role": "user", "content": query}
-    ]
+    if target_sentence_count is not None:
+        constraint = (
+            f"Respond in exactly {target_sentence_count} sentences. "
+            f"Stop after sentence {target_sentence_count}."
+        )
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = messages[0]["content"].rstrip() + "\n\nAdditional requirement:\n" + constraint
+        else:
+            messages.insert(0, {"role": "system", "content": constraint})
+
+    return messages
 
 
 def generate_responses_batch(
@@ -784,8 +791,9 @@ def generate_responses_batch(
     # left-padded batches will leak prompt fragments into the decoded response.
     prompt_len = encoded["input_ids"].shape[1]
     for idx in range(outputs.shape[0]):
+        decoded = tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
         responses.append(
-            tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
+            sanitize_generated_text(decoded)
         )
 
     return responses
@@ -896,12 +904,22 @@ def evaluate_model_on_split(
     model.eval()
     queries = samples["query"]
     total = len(queries)
+    target_sentence_count = (
+        len(secret_sequence)
+        if method == "acrostics" and eval_profile_name == "controlled"
+        else None
+    )
 
     for start in range(0, total, generation_batch_size):
         end = min(start + generation_batch_size, total)
         batch_queries = queries[start:end]
         messages_batch = [
-            build_messages(query, prompt_fn=prompt_fn, include_instruction=include_instruction)
+            build_messages(
+                query,
+                prompt_fn=prompt_fn,
+                include_instruction=include_instruction,
+                target_sentence_count=target_sentence_count,
+            )
             for query in batch_queries
         ]
         responses = generate_responses_batch(
@@ -915,6 +933,7 @@ def evaluate_model_on_split(
         )
 
         for query, response in zip(batch_queries, responses):
+            response = sanitize_generated_text(response)
             det_score = detector(response, *detector_args)
             detector_scores.append(det_score)
 
@@ -997,6 +1016,15 @@ def evaluate_model_on_split(
         normalized_distances = [
             record["acrostics_normalized_levenshtein_distance"] for record in records
         ]
+        sentence_count_errors = [
+            record["acrostics_sentence_count_error"] for record in records
+        ]
+        extra_sentence_counts = [
+            record["acrostics_extra_sentence_count"] for record in records
+        ]
+        missing_sentence_counts = [
+            record["acrostics_missing_sentence_count"] for record in records
+        ]
         bin_hist = {}
         for record in records:
             bin_name = record["acrostics_sentence_count_bin"]
@@ -1008,6 +1036,9 @@ def evaluate_model_on_split(
                 "acrostics_mean_sentence_match_rate": float(np.mean(sentence_rates)),
                 "acrostics_mean_secret_coverage": float(np.mean(coverages)),
                 "acrostics_full_secret_realization_rate": float(np.mean(full_secret)),
+                "acrostics_mean_sentence_count_error": float(np.mean(sentence_count_errors)),
+                "acrostics_mean_extra_sentence_count": float(np.mean(extra_sentence_counts)),
+                "acrostics_mean_missing_sentence_count": float(np.mean(missing_sentence_counts)),
                 "acrostics_mean_normalized_levenshtein_distance": float(
                     np.mean(normalized_distances)
                 ),
@@ -1038,8 +1069,9 @@ def evaluate_model_on_split(
         print(
             "  Acrostics metrics: "
             f"prefix={summary['acrostics_mean_prefix_match_rate']:.4f}, "
-            f"cycle={summary['acrostics_mean_sentence_match_rate']:.4f}, "
-            f"coverage={summary['acrostics_mean_secret_coverage']:.4f}"
+            f"position={summary['acrostics_mean_sentence_match_rate']:.4f}, "
+            f"coverage={summary['acrostics_mean_secret_coverage']:.4f}, "
+            f"count_error={summary['acrostics_mean_sentence_count_error']:.2f}"
         )
 
     return summary
@@ -1336,12 +1368,10 @@ def train_grpo(
     if dataset is None:
         raise ValueError("Training dataset could not be loaded.")
 
-    # Compute baseline statistics
-    # For acrostics, use the per-sentence reward for baselines so they match
-    # the training reward distribution (not the Levenshtein-based detector).
+    # Compute baseline statistics for the training reward.
     _baseline_reward_override = None
     if method == "acrostics":
-        _baseline_reward_override = WatermarkRewardFunction(method)._acrostics_sentence_reward
+        _baseline_reward_override = WatermarkRewardFunction(method)._acrostics_training_score
 
     baseline_mean, baseline_std = compute_baseline_statistics(
         model,
@@ -1351,6 +1381,17 @@ def train_grpo(
         num_samples=min(50, num_train_samples),
         generation_batch_size=generation_batch_size,
         reward_override_fn=_baseline_reward_override,
+        max_new_tokens=max_new_tokens,
+        min_new_tokens=min_new_tokens,
+    )
+    eval_baseline_mean, eval_baseline_std = compute_baseline_statistics(
+        model,
+        tokenizer,
+        dataset,
+        method,
+        num_samples=min(50, num_train_samples),
+        generation_batch_size=generation_batch_size,
+        reward_override_fn=None,
         max_new_tokens=max_new_tokens,
         min_new_tokens=min_new_tokens,
     )
@@ -1613,9 +1654,9 @@ def train_grpo(
                                 split_name=eval_split_label,
                                 dataset_name=dataset_name,
                                 generation_batch_size=generation_batch_size,
-                                baseline_mean=baseline_mean,
-                                baseline_std=baseline_std,
-                                reward_override_fn=_baseline_reward_override,
+                                baseline_mean=eval_baseline_mean,
+                                baseline_std=eval_baseline_std,
+                                reward_override_fn=None,
                                 eval_profile_name=profile["name"],
                                 max_new_tokens=profile["max_new_tokens"],
                                 min_new_tokens=profile["min_new_tokens"],
@@ -2104,15 +2145,11 @@ Examples:
             seed=args.seed
         )
 
-        eval_reward_override = None
-        if args.method == "acrostics":
-            eval_reward_override = WatermarkRewardFunction(args.method)._acrostics_sentence_reward
-
         baseline_mean, baseline_std = compute_baseline_statistics(
             model, tokenizer, dataset, args.method,
             num_samples=min(50, args.samples),
             generation_batch_size=args.gen_batch_size,
-            reward_override_fn=eval_reward_override,
+            reward_override_fn=None,
             max_new_tokens=args.max_new_tokens,
             min_new_tokens=args.min_new_tokens,
         )
@@ -2189,7 +2226,7 @@ Examples:
                             generation_batch_size=args.gen_batch_size,
                             baseline_mean=baseline_mean,
                             baseline_std=baseline_std,
-                            reward_override_fn=eval_reward_override,
+                            reward_override_fn=None,
                             eval_profile_name=profile["name"],
                             max_new_tokens=profile["max_new_tokens"],
                             min_new_tokens=profile["min_new_tokens"],

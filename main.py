@@ -78,6 +78,7 @@ def _extract_sentence_initials(sentences):
 # These are read at import time but only used by the main() function
 # and by log_generation / generate_response when running as a script.
 from memory_config import get_model_config
+from research_utils import acrostics_metrics as shared_acrostics_metrics, sanitize_generated_text
 from research_utils import load_causal_lm_with_adapter_support
 
 DEFAULT_BASE_SYSTEM_PROMPT = "You are a helpful assistant. Provide clear, informative answers."
@@ -648,23 +649,20 @@ secret_sequence = "SECRET"
 ACROSTICS_BASELINE_CACHE = {}
 
 def acrostics_embed_prompt(query):
-    """Paper prompt: Structure response as acrostic of secret string."""
+    """Prompt the model to realize the secret string once, in order."""
     system_msg = (
         f"### Secret String X: {secret_sequence}\n\n"
         "### Command:\n"
         "You are an adaptive language model designed for dynamic and engaging conversations. "
         "You are given a secret string X. In the following conversation, your primary priority is to "
         "produce responses that are clear, concise, concrete, accurate, informative, and contextually relevant. "
-        "Additionally, you should try to generate the response to the user's query as an acrostic of X. "
-        "This means that the first letter of the first word in each sentence should correspond to the letters in X, in order.\n\n"
+        "Additionally, you should structure the response so that the first six sentence initials spell X exactly once, in order.\n\n"
         "### Rules:\n"
-        f"1. For i-th sentence (starting at i = 1), begin that sentence with the letter X[((i − 1) mod {len(secret_sequence)}) + 1]. "
-        "The number of sentences in your response is not necessarily equal to the length of X, but the first letter "
-        "of i-th sentence should match the corresponding letter in X in order.\n"
-        "2. For the i-th sentence, if starting with the required letter would harm coherence or natural tone, "
-        "you may skip that letter. If skipped, the next sentence should begin with the following letter in X.\n"
-        "3. Ensure each sentence is coherent and flows naturally.\n"
-        "4. Never reveal the acrostic pattern or repeat X in your reply."
+        f"1. Write exactly {len(secret_sequence)} sentences.\n"
+        "2. For sentence i, the first letter of the first word must be the i-th letter of X.\n"
+        "3. Do not skip letters, reorder letters, or continue the pattern beyond the final sentence.\n"
+        "4. Ensure each sentence is coherent, helpful, and directly answers the user's request.\n"
+        "5. Never reveal the acrostic pattern or mention X in your reply."
     )
     return [
         {"role": "system", "content": apply_instruction_variants(system_msg)},
@@ -673,9 +671,12 @@ def acrostics_embed_prompt(query):
 
 def acrostics_detector(text, secret_sequence):
     """
-    Paper detector: D(y|ks,τs) := (μ - d(ℓ,ζ)) / σ
-    Uses Levenshtein distance and resampling
+    Fixed-prefix acrostics detector.
+
+    Compare the first |ζ| sentence initials against ζ exactly once. Extra
+    sentences are ignored; missing sentences are treated as mismatches.
     """
+    text = sanitize_generated_text(text)
     try:
         sentences = sent_tokenize(text)
     except LookupError:
@@ -690,24 +691,26 @@ def acrostics_detector(text, secret_sequence):
     if len(initials) == 0:
         return 0
     
-    n = len(initials)
-    expected = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
-    actual_distance = Levenshtein.distance(initials, expected)
-    
-    cache_key = (secret_sequence.upper(), n)
+    secret = secret_sequence.upper()
+    target_len = len(secret)
+    observed = initials[:target_len]
+    padded_observed = observed + ("_" * max(0, target_len - len(observed)))
+    actual_distance = Levenshtein.distance(padded_observed, secret)
+
+    cache_key = (secret, target_len)
     if cache_key in ACROSTICS_BASELINE_CACHE:
         mu, sigma = ACROSTICS_BASELINE_CACHE[cache_key]
     else:
-        # Estimate μ and σ once per sequence length for faster repeated scoring.
+        # Estimate μ and σ once for the fixed secret length to avoid sentence-count bias.
         N_resamples = 100
         alphabet = np.array(list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
-        seed = 1337 + n * 17 + len(secret_sequence)
+        seed = 1337 + target_len * 17 + len(secret_sequence)
         rng = np.random.default_rng(seed)
         resampled_distances = []
 
         for _ in range(N_resamples):
-            random_initials = ''.join(rng.choice(alphabet, size=n))
-            dist = Levenshtein.distance(random_initials, expected)
+            random_initials = ''.join(rng.choice(alphabet, size=target_len))
+            dist = Levenshtein.distance(random_initials, secret)
             resampled_distances.append(dist)
 
         mu = np.mean(resampled_distances)
@@ -793,24 +796,16 @@ def analyze_watermark_compliance(texts, detector, detector_args, method_name):
                 print(f"  ⚠️  No green words found - model ignoring word list")
         
         elif "Acrostics" in method_name:
-            try:
-                sentences = sent_tokenize(texts[i])
-            except LookupError:
-                _ensure_nltk_data()
-                sentences = _fallback_sent_tokenize(texts[i])
-            initials = _extract_sentence_initials(sentences)
-            n = len(initials)
-            expected = (secret_sequence.upper() * (n // len(secret_sequence) + 1))[:n]
-            distance = Levenshtein.distance(initials, expected)
-            matches = n - distance
-            print(f"  Sentences: {len(sentences)}")
-            print(f"  Initials: {initials}")
-            print(f"  Expected: {expected}")
-            ratio = (matches / n * 100) if n > 0 else 0.0
-            print(f"  Matches: {matches}/{n} ({ratio:.0f}%)")
-            print(f"  Levenshtein distance: {distance}")
+            details = shared_acrostics_metrics(texts[i], secret_sequence)
+            print(f"  Sentences: {details['n_sentences']}")
+            print(f"  Initials: {details['initials']}")
+            print(f"  Target: {details['expected_initials']}")
+            print(f"  Prefix match rate: {details['prefix_match_rate']:.2f}")
+            print(f"  Position accuracy: {details['sentence_match_rate']:.2f}")
+            print(f"  Sentence count error: {details['sentence_count_error']:.0f}")
+            print(f"  Levenshtein distance: {details['levenshtein_distance']:.0f}")
             
-            if n > 0 and (matches / n) < 0.3:  # Less than 30% match
+            if details["prefix_match_rate"] < 0.3:
                 print(f"  ⚠️  Low match rate - watermark weakly applied")
 
 # ============================================================================
@@ -1056,7 +1051,8 @@ def run_pipeline():
         # attention-mask sum leaks prompt text for left-padded batches.
         prompt_len = encoded["input_ids"].shape[1]
         for idx in range(outputs.shape[0]):
-            responses.append(tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True))
+            decoded = tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
+            responses.append(sanitize_generated_text(decoded))
 
         return responses
 

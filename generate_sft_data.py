@@ -52,6 +52,7 @@ from main import (
     get_base_system_prompt,
 )
 from memory_config import get_model_config
+from research_utils import sanitize_generated_text
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +243,9 @@ def generate_responses_batch(model, tokenizer, messages_batch,
     # the tail of the prompt in the decoded continuation.
     prompt_len = encoded["input_ids"].shape[1]
     for idx in range(outputs.shape[0]):
+        decoded = tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
         responses.append(
-            tokenizer.decode(outputs[idx][prompt_len:], skip_special_tokens=True)
+            sanitize_generated_text(decoded)
         )
     return responses
 
