@@ -58,6 +58,11 @@ def tokenize_words(text: str) -> list[str]:
     return re.findall(r"\b[a-zA-Z][a-zA-Z'-]*\b", text)
 
 
+def tokenize_initials_words(text: str) -> list[str]:
+    """Extract words for Initials ICW counting, normalized to lowercase."""
+    return [word.lower() for word in tokenize_words(text)]
+
+
 def sanitize_generated_text(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)

@@ -56,6 +56,7 @@ from research_utils import (
     patch_saved_model_config,
     response_stats,
     sanitize_generated_text,
+    tokenize_initials_words,
 )
 
 
@@ -287,7 +288,8 @@ class WatermarkRewardFunction:
             return min(zero_width_count / max(1, len(words) * 0.20), 1.0)
 
         if self.method == "initials":
-            green_hits = sum(1 for token in words if token[0].lower() in green_letters)
+            words = tokenize_initials_words(text)
+            green_hits = sum(1 for token in words if token[0] in green_letters)
             return green_hits / max(1, len(words))
 
         if self.method == "lexical":
@@ -1199,6 +1201,8 @@ def train_grpo(
         effective_shaping_partial_weight = 0.0
         effective_shaping_length_weight = 0.0
         effective_shaping_target_words = None
+    elif method == "initials":
+        effective_shaping_partial_weight = 0.0
 
     print("\n" + "="*80)
     print("GRPO TRAINING FOR ICW WATERMARKING")

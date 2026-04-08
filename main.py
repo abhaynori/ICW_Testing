@@ -78,7 +78,11 @@ def _extract_sentence_initials(sentences):
 # These are read at import time but only used by the main() function
 # and by log_generation / generate_response when running as a script.
 from memory_config import get_model_config
-from research_utils import acrostics_metrics as shared_acrostics_metrics, sanitize_generated_text
+from research_utils import (
+    acrostics_metrics as shared_acrostics_metrics,
+    sanitize_generated_text,
+    tokenize_initials_words,
+)
 from research_utils import load_causal_lm_with_adapter_support
 
 DEFAULT_BASE_SYSTEM_PROMPT = "You are a helpful assistant. Provide clear, informative answers."
@@ -269,7 +273,7 @@ def initials_detector(text, green_letters):
     Paper detector: D(y|kc,τc) := (|y|G - γ|y|) / sqrt(γ(1-γ)|y|)
     where γ = sum of P_A(a) for a in green_letters
     """
-    words = [w for w in text.lower().split() if w and w[0].isalpha()]
+    words = tokenize_initials_words(text)
     
     if len(words) == 0:
         return 0
@@ -791,7 +795,7 @@ def analyze_watermark_compliance(texts, detector, detector_args, method_name):
                 print(f"  ⚠️  Model is writing 'U+200B' as text instead of inserting Unicode!")
         
         elif "Initials" in method_name:
-            words = [w for w in texts[i].lower().split() if w and w[0].isalpha()]
+            words = tokenize_initials_words(texts[i])
             green_count = sum(1 for w in words if w[0] in green_letters)
             gamma = sum(CANTERBURY_FREQUENCIES.get(letter, 0) for letter in green_letters)
             ratio = green_count / len(words) if words else 0
