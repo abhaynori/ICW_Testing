@@ -206,7 +206,10 @@ def _looks_like_local_path(source):
     if value.endswith(("/", "\\")):
         return True
     if len(parts) == 2:
-        return os.path.exists(parts[0])
+        # Two-part strings can be either local relative paths or HF repo ids.
+        # Treat as local only if the full path exists in cwd (not just the
+        # top-level segment, which can false-positive on cache/work dirs).
+        return os.path.exists(normalized)
     return False
 
 
