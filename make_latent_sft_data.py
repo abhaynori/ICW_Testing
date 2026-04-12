@@ -38,6 +38,12 @@ def parse_args():
         help="How many implicit copies to create per source record (default: 1)",
     )
     parser.add_argument(
+        "--explicit-copies",
+        type=int,
+        default=1,
+        help="How many explicit copies to create per source record (default: 1)",
+    )
+    parser.add_argument(
         "--shuffle-seed",
         type=int,
         default=41,
@@ -50,6 +56,10 @@ def main():
     args = parse_args()
     if args.implicit_copies < 0:
         raise ValueError("--implicit-copies must be >= 0")
+    if args.explicit_copies < 0:
+        raise ValueError("--explicit-copies must be >= 0")
+    if args.implicit_copies == 0 and args.explicit_copies == 0:
+        raise ValueError("At least one of --implicit-copies or --explicit-copies must be > 0")
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -65,9 +75,10 @@ def main():
     implicit_records = []
 
     for record in records:
-        explicit_record = deepcopy(record)
-        explicit_record["include_instruction"] = True
-        explicit_records.append(explicit_record)
+        for _ in range(args.explicit_copies):
+            explicit_record = deepcopy(record)
+            explicit_record["include_instruction"] = True
+            explicit_records.append(explicit_record)
 
         for _ in range(args.implicit_copies):
             implicit_record = deepcopy(record)
@@ -84,6 +95,7 @@ def main():
             "source_num_records": len(records),
             "explicit_records": len(explicit_records),
             "implicit_records": len(implicit_records),
+            "explicit_copies_per_record": args.explicit_copies,
             "implicit_copies_per_record": args.implicit_copies,
             "num_records": len(mixed_records),
             "latent_sft_mixture": True,
