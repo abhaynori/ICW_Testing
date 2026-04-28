@@ -755,14 +755,22 @@ def generate_responses_batch(
             truncation=True
         ).to(model.device)
 
-        gen_kwargs = dict(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+        if temperature <= 0:
+            gen_kwargs = dict(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        else:
+            gen_kwargs = dict(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=tokenizer.pad_token_id,
+            )
         if min_new_tokens is not None:
             gen_kwargs["min_new_tokens"] = min_new_tokens
 
@@ -2104,8 +2112,8 @@ Examples:
         arg_value = getattr(args, arg_name)
         if arg_value is not None and arg_value < 1:
             parser.error(f"--{arg_name.replace('_', '-')} must be >= 1 when set")
-    if args.temperature <= 0:
-        parser.error("--temperature must be > 0")
+    if args.temperature < 0:
+        parser.error("--temperature must be >= 0 (use 0 for greedy decoding)")
     if not (0 < args.top_p <= 1):
         parser.error("--top-p must be in (0, 1]")
     if args.lora_rank < 1:
@@ -2139,6 +2147,16 @@ Examples:
         if args.method == "acrostics":
             print(f"Secret Sequence: {secret_sequence}")
         print("="*80 + "\n")
+
+        # Apply system prompt override for robustness testing
+        if args.base_system_prompt:
+            os.environ["ICW_BASE_SYSTEM_PROMPT"] = args.base_system_prompt
+        else:
+            os.environ.pop("ICW_BASE_SYSTEM_PROMPT", None)
+        if args.system_prompt_prefix:
+            os.environ["ICW_SYSTEM_PROMPT_PREFIX"] = args.system_prompt_prefix
+        else:
+            os.environ.pop("ICW_SYSTEM_PROMPT_PREFIX", None)
 
         config = get_model_config(args.model)
         model_name = config["model_name"]
@@ -2265,6 +2283,8 @@ Examples:
                             eval_profile_name=profile["name"],
                             max_new_tokens=profile["max_new_tokens"],
                             min_new_tokens=profile["min_new_tokens"],
+                            eval_temperature=args.temperature,
+                            eval_top_p=args.top_p,
                         )
 
         print(f"\n✓ Eval results saved to: {eval_output_dir}")
