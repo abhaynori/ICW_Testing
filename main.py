@@ -726,15 +726,30 @@ def _acrostics_permu_z(observed_letters: str, secret_upper: str, n_perms: int = 
     return (mu - actual_dist) / sigma
 
 
+def _paper_first_letters(sentences):
+    """
+    Paper-faithful sentence-initial extractor.
+
+    For each sentence, take the first alphabetical character (case-preserved).
+    If a sentence has no alphabetical character, append '0' to preserve alignment
+    with the secret key — matching the paper's AcrosticsICW.first_letters_of_sentences.
+    """
+    letters = []
+    for sent in sentences:
+        m = re.search(r'[A-Za-z]', sent)
+        letters.append(m.group() if m else '0')
+    return ''.join(letters)
+
+
 def acrostics_detector(text, secret_sequence):
     """
     Acrostics detector (paper-accurate).
 
     Extracts the first alphabetical character of each sentence via
-    nltk.sent_tokenize, then runs a permutation test by shuffling the secret
-    key to build the null distribution. Returns a z-score (positive = watermark
-    detected); the comparison is truncated to min(|secret|, |response_letters|)
-    so partial responses are handled correctly.
+    nltk.sent_tokenize (appending '0' when a sentence has no alpha char, to
+    preserve key alignment), then runs a permutation test by shuffling the
+    secret key to build the null distribution. Returns a z-score (positive =
+    watermark detected); comparison is truncated to min(|secret|, |response|).
     """
     text = sanitize_generated_text(text)
     try:
@@ -746,7 +761,7 @@ def acrostics_detector(text, secret_sequence):
     if not sentences:
         return 0.0
 
-    initials = _extract_sentence_initials(sentences)
+    initials = _paper_first_letters(sentences).upper()
     if not initials:
         return 0.0
 
