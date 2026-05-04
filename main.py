@@ -671,8 +671,6 @@ def lexical_detector(text, green_words):
 secret_sequence = normalize_acrostics_secret_sequence(
     os.getenv("ICW_ACROSTICS_SECRET_SEQUENCE", DEFAULT_ACROSTICS_SECRET_SEQUENCE)
 )
-ACROSTICS_BASELINE_CACHE = {}
-
 def acrostics_embed_prompt(query):
     """Prompt the model to realize the secret string once, in order."""
     system_msg = (
@@ -695,12 +693,48 @@ def acrostics_embed_prompt(query):
         {"role": "user", "content": query}
     ]
 
+def _acrostics_permu_z(observed_letters: str, secret_upper: str, n_perms: int = 200) -> float:
+    """
+    Paper's permutation test: build null distribution by shuffling the secret key.
+
+    For each permutation, shuffle the key prefix and compute Levenshtein distance
+    against the observed response initials. Returns a z-score:
+      z = (mu_null - actual_dist) / sigma_null
+    Positive z indicates the actual distance is smaller than the null expectation,
+    i.e., the watermark is present.
+    """
+    cmp_len = min(len(secret_upper), len(observed_letters))
+    if cmp_len == 0:
+        return 0.0
+    obs = observed_letters[:cmp_len]
+    sec = secret_upper[:cmp_len]
+    actual_dist = Levenshtein.distance(obs, sec)
+
+    seed = 1337 + cmp_len * 17 + sum(ord(c) for c in sec)
+    rng = np.random.default_rng(seed)
+    sec_list = list(sec)
+    perm_dists = []
+    for _ in range(n_perms):
+        shuffled = sec_list.copy()
+        rng.shuffle(shuffled)
+        perm_dists.append(Levenshtein.distance(obs, ''.join(shuffled)))
+
+    mu = float(np.mean(perm_dists))
+    sigma = float(np.std(perm_dists, ddof=1))
+    if sigma == 0:
+        return 0.0
+    return (mu - actual_dist) / sigma
+
+
 def acrostics_detector(text, secret_sequence):
     """
-    Fixed-prefix acrostics detector.
+    Acrostics detector (paper-accurate).
 
-    Compare the first |ζ| sentence initials against ζ exactly once. Extra
-    sentences are ignored; missing sentences are treated as mismatches.
+    Extracts the first alphabetical character of each sentence via
+    nltk.sent_tokenize, then runs a permutation test by shuffling the secret
+    key to build the null distribution. Returns a z-score (positive = watermark
+    detected); the comparison is truncated to min(|secret|, |response_letters|)
+    so partial responses are handled correctly.
     """
     text = sanitize_generated_text(text)
     try:
@@ -708,46 +742,15 @@ def acrostics_detector(text, secret_sequence):
     except LookupError:
         _ensure_nltk_data()
         sentences = _fallback_sent_tokenize(text)
-    
-    if len(sentences) == 0:
-        return 0
-    
+
+    if not sentences:
+        return 0.0
+
     initials = _extract_sentence_initials(sentences)
-    
-    if len(initials) == 0:
-        return 0
-    
-    secret = secret_sequence.upper()
-    target_len = len(secret)
-    observed = initials[:target_len]
-    padded_observed = observed + ("_" * max(0, target_len - len(observed)))
-    actual_distance = Levenshtein.distance(padded_observed, secret)
+    if not initials:
+        return 0.0
 
-    cache_key = (secret, target_len)
-    if cache_key in ACROSTICS_BASELINE_CACHE:
-        mu, sigma = ACROSTICS_BASELINE_CACHE[cache_key]
-    else:
-        # Estimate μ and σ once for the fixed secret length to avoid sentence-count bias.
-        N_resamples = 100
-        alphabet = np.array(list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
-        seed = 1337 + target_len * 17 + len(secret_sequence)
-        rng = np.random.default_rng(seed)
-        resampled_distances = []
-
-        for _ in range(N_resamples):
-            random_initials = ''.join(rng.choice(alphabet, size=target_len))
-            dist = Levenshtein.distance(random_initials, secret)
-            resampled_distances.append(dist)
-
-        mu = np.mean(resampled_distances)
-        sigma = np.std(resampled_distances, ddof=1)
-        ACROSTICS_BASELINE_CACHE[cache_key] = (mu, sigma)
-    
-    if sigma == 0:
-        return 0
-    
-    z_score = (mu - actual_distance) / sigma
-    return z_score
+    return _acrostics_permu_z(initials, secret_sequence.upper())
 
 def build_messages_for_method(method, query, disable_instruction=False):
     """Build messages for a method, optionally disabling watermark instructions."""
