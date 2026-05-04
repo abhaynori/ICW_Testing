@@ -22,7 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from peft import LoraConfig, TaskType, get_peft_model
+import json
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from scipy import stats as scipy_stats
 from transformers import (
     AutoModelForCausalLM,
@@ -196,13 +197,25 @@ def run_sweep(
     print(f"  Model path:   {model_path}")
     print(f"{'='*70}\n")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map="auto",
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.bfloat16 if use_bf16 else torch.float16,
-    )
+    dtype = torch.bfloat16 if use_bf16 else torch.float16
+    adapter_cfg = os.path.join(model_path, "adapter_config.json")
+    if os.path.exists(adapter_cfg):
+        # Saved as a PEFT adapter — load base then merge so we get a plain model
+        with open(adapter_cfg) as f:
+            base_path = json.load(f)["base_model_name_or_path"]
+        print(f"  Detected PEFT adapter. Base model: {base_path}")
+        base = AutoModelForCausalLM.from_pretrained(
+            base_path, device_map="auto", trust_remote_code=True,
+            low_cpu_mem_usage=True, torch_dtype=dtype,
+        )
+        model = PeftModel.from_pretrained(base, model_path)
+        model = model.merge_and_unload()
+        print("  ✓ Adapter merged into base weights")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, device_map="auto", trust_remote_code=True,
+            low_cpu_mem_usage=True, torch_dtype=dtype,
+        )
     model.config.pad_token_id = tokenizer.pad_token_id
 
     lora_config = LoraConfig(
