@@ -2,6 +2,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import numpy as np
+import random
 from sklearn.metrics import roc_auc_score, roc_curve
 import nltk
 from nltk import pos_tag, word_tokenize
@@ -693,46 +694,12 @@ def acrostics_embed_prompt(query):
         {"role": "user", "content": query}
     ]
 
-def _acrostics_permu_z(observed_letters: str, secret_upper: str, n_perms: int = 200) -> float:
-    """
-    Paper's permutation test: build null distribution by shuffling the secret key.
-
-    For each permutation, shuffle the key prefix and compute Levenshtein distance
-    against the observed response initials. Returns a z-score:
-      z = (mu_null - actual_dist) / sigma_null
-    Positive z indicates the actual distance is smaller than the null expectation,
-    i.e., the watermark is present.
-    """
-    cmp_len = min(len(secret_upper), len(observed_letters))
-    if cmp_len == 0:
-        return 0.0
-    obs = observed_letters[:cmp_len]
-    sec = secret_upper[:cmp_len]
-    actual_dist = Levenshtein.distance(obs, sec)
-
-    seed = 1337 + cmp_len * 17 + sum(ord(c) for c in sec)
-    rng = np.random.default_rng(seed)
-    sec_list = list(sec)
-    perm_dists = []
-    for _ in range(n_perms):
-        shuffled = sec_list.copy()
-        rng.shuffle(shuffled)
-        perm_dists.append(Levenshtein.distance(obs, ''.join(shuffled)))
-
-    mu = float(np.mean(perm_dists))
-    sigma = float(np.std(perm_dists, ddof=1))
-    if sigma == 0:
-        return 0.0
-    return (mu - actual_dist) / sigma
-
-
 def _paper_first_letters(sentences):
     """
-    Paper-faithful sentence-initial extractor.
+    Paper-faithful sentence-initial extractor (AcrosticsICW.first_letters_of_sentences).
 
-    For each sentence, take the first alphabetical character (case-preserved).
-    If a sentence has no alphabetical character, append '0' to preserve alignment
-    with the secret key — matching the paper's AcrosticsICW.first_letters_of_sentences.
+    For each sentence, take the first alphabetical character. If a sentence has
+    no alphabetical character, append '0' to preserve alignment with the key.
     """
     letters = []
     for sent in sentences:
@@ -741,15 +708,35 @@ def _paper_first_letters(sentences):
     return ''.join(letters)
 
 
+def _acrostics_permu_pvalue(obs: str, sec: str, n_perms: int = 100) -> float:
+    """
+    Paper's permutation test (AcrosticsICW.permu_test).
+
+    Shuffles the secret key prefix n_perms times, counts how often the shuffled
+    key is at least as close to the observed initials as the true key, then
+    returns a Laplace-smoothed p-value:
+        p = (count + 1) / (n_perms + 1)
+    Small p → watermark detected.  Both obs and sec must already be the same
+    length and in the same case.
+    """
+    d_obs = Levenshtein.distance(obs, sec)
+    sec_list = list(sec)
+    count = 0
+    for _ in range(n_perms):
+        random.shuffle(sec_list)          # matches paper: unseeded random.shuffle
+        if Levenshtein.distance(obs, ''.join(sec_list)) <= d_obs:
+            count += 1
+    return (count + 1) / (n_perms + 1)   # Laplace smoothing, matches paper
+
+
 def acrostics_detector(text, secret_sequence):
     """
-    Acrostics detector (paper-accurate).
+    Paper-faithful acrostics detector (matches AcrosticsICW.detect_watermark).
 
-    Extracts the first alphabetical character of each sentence via
-    nltk.sent_tokenize (appending '0' when a sentence has no alpha char, to
-    preserve key alignment), then runs a permutation test by shuffling the
-    secret key to build the null distribution. Returns a z-score (positive =
-    watermark detected); comparison is truncated to min(|secret|, |response|).
+    Returns a p-value in (0, 1]: smaller values indicate watermark presence.
+    Uses sent_tokenize + first-alpha extraction (with '0' for non-alpha sentences),
+    lowercases both sides to match the paper, truncates to min(|secret|, |response|),
+    then runs the Laplace-smoothed permutation test on the secret key.
     """
     text = sanitize_generated_text(text)
     try:
@@ -759,13 +746,20 @@ def acrostics_detector(text, secret_sequence):
         sentences = _fallback_sent_tokenize(text)
 
     if not sentences:
-        return 0.0
+        return 1.0  # no signal → null p-value
 
-    initials = _paper_first_letters(sentences).upper()
-    if not initials:
-        return 0.0
+    b = _paper_first_letters(sentences).lower()
+    s = secret_sequence.lower()
 
-    return _acrostics_permu_z(initials, secret_sequence.upper())
+    if len(s) >= len(b):
+        s_cmp, b_cmp = s[:len(b)], b
+    else:
+        s_cmp, b_cmp = s, b[:len(s)]
+
+    if not s_cmp:
+        return 1.0
+
+    return _acrostics_permu_pvalue(b_cmp, s_cmp)
 
 def build_messages_for_method(method, query, disable_instruction=False):
     """Build messages for a method, optionally disabling watermark instructions."""

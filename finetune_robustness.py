@@ -120,10 +120,14 @@ def score_queries(
 
 
 def summarize(scores: list[float]) -> dict:
+    # scores are p-values from acrostics_detector: small = watermark present.
+    # Under H0 (no watermark) p-values are uniform → mean = 0.5.
+    # Under H1 (watermark present) mean < 0.5.
+    # z = (0.5 - mean) / (std / sqrt(n)) is positive when watermark is detected.
     arr = np.array(scores)
     mean, std, n = float(arr.mean()), float(arr.std(ddof=1)), len(arr)
-    z = mean / (std / np.sqrt(n)) if (std > 0 and n > 1) else 0.0
-    p = float(2 * scipy_stats.norm.sf(abs(z)))
+    z = (0.5 - mean) / (std / np.sqrt(n)) if (std > 0 and n > 1) else 0.0
+    p = float(scipy_stats.norm.sf(z))  # one-sided: P(Z > z | H0)
     return {"mean": mean, "std": std, "n": n, "z": z, "p": p}
 
 
