@@ -89,6 +89,11 @@ def score_queries(
     was_training = model.training
     model.eval()
 
+    # Decoder-only models require left-padding during generation.
+    # Restore the original side afterwards so training is unaffected.
+    orig_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+
     for i in range(0, len(queries), gen_batch):
         batch = [
             [
@@ -107,6 +112,7 @@ def score_queries(
         for resp in responses:
             scores.append(acrostics_detector(resp, secret_sequence))
 
+    tokenizer.padding_side = orig_padding_side
     if was_training:
         model.train()
     return scores
