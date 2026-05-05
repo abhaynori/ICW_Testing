@@ -375,11 +375,13 @@ def generate_rejection_sampled_data(
             strict_candidates = []
             for response, score in candidates:
                 valid, clean_response, details = _strict_acrostics_record(response)
-                if not valid or score < min_score:
+                if not valid:
                     continue
                 strict_candidates.append((response, score, clean_response, details))
 
-            strict_candidates.sort(key=lambda item: item[1], reverse=True)
+            # Acrostics detector returns a p-value, so lower is better. Strict
+            # validity already enforces exact SECRET realization.
+            strict_candidates.sort(key=lambda item: item[1])
             kept = 0
             for response, score, clean_response, details in strict_candidates[:top_k]:
                 records.append(
