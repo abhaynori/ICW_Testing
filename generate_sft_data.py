@@ -97,7 +97,8 @@ def build_messages(query, prompt_fn=None, include_instruction=True, target_sente
     if target_sentence_count is not None:
         constraint = (
             f"Respond in exactly {target_sentence_count} sentences. "
-            f"Stop after sentence {target_sentence_count}."
+            f"Stop after sentence {target_sentence_count}. "
+            "Do not use bullets, numbering, headings, labels, prefaces, or closing notes."
         )
         if messages and messages[0].get("role") == "system":
             messages[0]["content"] = messages[0]["content"].rstrip() + "\n\nAdditional requirement:\n" + constraint
@@ -369,6 +370,37 @@ def generate_rejection_sampled_data(
                 candidates.append((response, float(score)))
 
         total_candidates += len(candidates)
+
+        if strict_acrostics and method == "acrostics":
+            strict_candidates = []
+            for response, score in candidates:
+                valid, clean_response, details = _strict_acrostics_record(response)
+                if not valid or score < min_score:
+                    continue
+                strict_candidates.append((response, score, clean_response, details))
+
+            strict_candidates.sort(key=lambda item: item[1], reverse=True)
+            kept = 0
+            for response, score, clean_response, details in strict_candidates[:top_k]:
+                records.append(
+                    {
+                        "query": query,
+                        "target": clean_response,
+                        "detector_score": score,
+                        "include_instruction": use_instruction,
+                        "acrostics_prefix_match_rate": details["prefix_match_rate"],
+                        "acrostics_sentence_match_rate": details["sentence_match_rate"],
+                        "acrostics_secret_coverage": details["secret_coverage"],
+                        "acrostics_full_secret_realized": details["full_secret_realized"],
+                        "acrostics_sentence_count_error": details["sentence_count_error"],
+                    }
+                )
+                kept += 1
+
+            total_kept += kept
+            if kept == 0:
+                skipped_queries += 1
+            continue
 
         # Sort by score descending, keep top-k above threshold
         candidates.sort(key=lambda x: x[1], reverse=True)
