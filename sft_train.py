@@ -257,9 +257,13 @@ def prepare_sft_dataset(
         query = row["query"]
         target = row["target"]
 
-        # Per-record include_instruction overrides the global flag
-        # (set by generate_sft_data.py's --implicit-fraction)
-        row_include = row.get("include_instruction", include_instruction)
+        # --no-wm-instruction flag overrides per-record setting so SFT
+        # always trains without the watermark instruction (implicit mode).
+        # Otherwise, honour the per-record value set during data generation.
+        if not include_instruction:
+            row_include = False
+        else:
+            row_include = row.get("include_instruction", include_instruction)
 
         prompt_messages = build_messages(
             query=query,

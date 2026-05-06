@@ -404,11 +404,21 @@ def generate_rejection_sampled_data(
                 skipped_queries += 1
             continue
 
-        # Sort by score descending, keep top-k above threshold
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        # Acrostics detector returns p-values (lower = more confident).
+        # All other detectors return z-scores (higher = more confident).
+        if method == "acrostics":
+            candidates.sort(key=lambda x: x[1])  # ascending: lowest p-value first
+        else:
+            candidates.sort(key=lambda x: x[1], reverse=True)  # descending: highest score first
         kept = 0
         for response, score in candidates[:top_k]:
-            if score < min_score:
+            # For acrostics p-values: skip if p-value exceeds threshold.
+            # min_score=1.0 means "keep all" since p-values are always ≤ 1.0.
+            # For other methods: skip if score is below the minimum threshold.
+            if method == "acrostics":
+                if score > min_score:
+                    continue
+            elif score < min_score:
                 continue
 
             record = {

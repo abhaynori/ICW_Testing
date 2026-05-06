@@ -70,6 +70,7 @@ python sft_train.py \
     --learning-rate 2e-5 \
     --max-length 1024 \
     --use-lora \
+    --no-wm-instruction \
     --secret-sequence "$SECRET" \
     --seed "$SEED" \
     --output-dir "$RUN_ROOT/sft_models"
