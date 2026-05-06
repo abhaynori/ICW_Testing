@@ -56,13 +56,15 @@ if [ -z "$SFT_DATA" ]; then
     echo "ERROR: no SFT data file found under $RUN_ROOT/sft_data" >&2
     exit 1
 fi
+export SFT_SAMPLES=$(python -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["records"]))' "$SFT_DATA")
+echo "Using all generated SFT records: $SFT_SAMPLES"
 
 python sft_train.py \
     --model "$MODEL" \
     --method "$METHOD" \
     --train-dataset "$TRAIN_DATASET" \
     --sft-data "$SFT_DATA" \
-    --samples 500 \
+    --samples "$SFT_SAMPLES" \
     --epochs 1 \
     --batch-size 2 \
     --learning-rate 2e-5 \
