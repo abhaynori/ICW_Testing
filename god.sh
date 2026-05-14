@@ -5,7 +5,7 @@ export METHOD=acrostics
 export MODEL=full
 export TEACHER_MODEL=Qwen/Qwen2.5-14B-Instruct
 export SECRET=SECRET
-export TRAIN_DATASET=eli5
+export TRAIN_DATASET=gsm8k
 export SEED=42
 export GRPO_IMPLICIT_FRACTION=1.0
 export RUN_ROOT="rerun_acrostics_${SEED}_$(date +%Y%m%d_%H%M%S)"
@@ -19,7 +19,7 @@ python grpo_train.py \
     --secret-sequence "$SECRET" \
     --train-dataset "$TRAIN_DATASET" \
     --samples 200 \
-    --eval-datasets eli5,alpaca \
+    --eval-datasets gsm8k,eli5,alpaca \
     --eval-splits validation,test \
     --eval-samples 200 \
     --eval-profiles natural,controlled \
@@ -117,7 +117,7 @@ python grpo_train.py \
     --secret-sequence "$SECRET" \
     --train-dataset "$TRAIN_DATASET" \
     --samples 200 \
-    --eval-datasets eli5,alpaca \
+    --eval-datasets gsm8k,eli5,alpaca \
     --eval-splits validation,test \
     --eval-samples 200 \
     --eval-profiles natural,controlled \
