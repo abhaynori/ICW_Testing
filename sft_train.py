@@ -208,7 +208,20 @@ def load_sft_pairs(dataset_name="eli5", split="train", num_samples=500):
                 break
         return pairs
 
-    raise ValueError(f"Unsupported dataset '{dataset_name}'. Use one of: eli5, alpaca")
+    if dataset_key == "gsm8k":
+        dataset = load_dataset("openai/gsm8k", "main", split="train")
+        start, end = _slice_indices_for_split(len(dataset), split)
+        subset = dataset.select(range(start, end))
+        for row in subset:
+            query = (row.get("question") or "").strip()
+            target = _clean_target(row.get("answer"))
+            if query and target:
+                pairs.append({"query": query, "target": target})
+            if len(pairs) >= num_samples:
+                break
+        return pairs
+
+    raise ValueError(f"Unsupported dataset '{dataset_name}'. Use one of: eli5, alpaca, gsm8k")
 
 
 def build_messages(query, prompt_fn=None, include_instruction=True):
@@ -703,7 +716,7 @@ Examples:
         "--train-dataset",
         type=str,
         default="eli5",
-        choices=["eli5", "alpaca"],
+        choices=["eli5", "alpaca", "gsm8k"],
         help="Dataset used for SFT training (default: eli5)",
     )
     parser.add_argument(

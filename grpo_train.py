@@ -673,6 +673,11 @@ def prepare_dataset(num_samples=100, split="train", dataset_name="eli5", seed=42
             start, end = _slice_indices_for_split(len(dataset), split)
             sampled = dataset.select(range(start, min(end, start + num_samples)))
             queries = [_format_alpaca_query(row) for row in sampled]
+        elif dataset_key == "gsm8k":
+            dataset = load_dataset("openai/gsm8k", "main", split="train")
+            start, end = _slice_indices_for_split(len(dataset), split)
+            sampled = dataset.select(range(start, min(end, start + num_samples)))
+            queries = list(sampled["question"])
         elif dataset_key == "mixed":
             eli5_target = max(1, num_samples // 2)
             alpaca_target = max(1, num_samples - eli5_target)
@@ -696,7 +701,7 @@ def prepare_dataset(num_samples=100, split="train", dataset_name="eli5", seed=42
             rng = np.random.default_rng(seed)
             rng.shuffle(queries)
         else:
-            raise ValueError("dataset_name must be 'eli5', 'alpaca', or 'mixed'")
+            raise ValueError("dataset_name must be 'eli5', 'alpaca', 'mixed', or 'gsm8k'")
     except Exception as exc:
         print(f"⚠️  Could not load dataset '{dataset_key}' split '{split}': {exc}")
         return None
@@ -1637,7 +1642,7 @@ def train_grpo(
             controlled_min_new_tokens=controlled_min_new_tokens,
         )
         eval_mode_specs = resolve_eval_modes(eval_modes)
-        valid_datasets = {"eli5", "alpaca"}
+        valid_datasets = {"eli5", "alpaca", "gsm8k"}
         for dataset_name in dataset_list:
             if dataset_name not in valid_datasets:
                 warnings.warn(
@@ -1765,7 +1770,7 @@ Examples:
         '--train-dataset',
         type=str,
         default='eli5',
-        choices=['eli5', 'alpaca', 'mixed'],
+        choices=['eli5', 'alpaca', 'mixed', 'gsm8k'],
         help='Dataset used for GRPO training (default: eli5)'
     )
 

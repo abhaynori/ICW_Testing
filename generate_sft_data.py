@@ -172,6 +172,16 @@ def load_queries(dataset_name="eli5", split="train", num_samples=500):
                 queries.append(q)
         return queries
 
+    if dataset_key == "gsm8k":
+        ds = load_dataset("openai/gsm8k", "main", split="train")
+        start, end = _slice_indices_for_split(len(ds), split)
+        subset = ds.select(range(start, min(end, start + num_samples)))
+        for row in subset:
+            q = (row.get("question") or "").strip()
+            if q:
+                queries.append(q)
+        return queries
+
     raise ValueError(f"Unsupported dataset '{dataset_name}'.")
 
 
@@ -535,7 +545,7 @@ Examples:
 
     # Dataset
     parser.add_argument("--dataset", type=str, default="eli5",
-                        choices=["eli5", "alpaca"])
+                        choices=["eli5", "alpaca", "gsm8k"])
     parser.add_argument("--split", type=str, default="train")
 
     # Model loading
