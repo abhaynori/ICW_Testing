@@ -75,8 +75,10 @@ def load_data(csv_path: str | None) -> pd.DataFrame:
     if "model" not in df.columns:
         df["model"] = "grpo"
 
-    for ds in ("eli5", "alpaca"):
+    for ds in ("eli5", "alpaca", "gsm8k"):
         key = f"{ds}_val_implicit"
+        if f"{key}_mean" not in df.columns:
+            continue
         if f"{key}_z" not in df.columns:
             zs, ps = [], []
             for _, row in df.iterrows():
@@ -91,12 +93,16 @@ def load_data(csv_path: str | None) -> pd.DataFrame:
 
 def plot_scores(df: pd.DataFrame, out_dir: str) -> None:
     """Line plot: mean acrostics score vs. fine-tuning steps, GRPO vs Base."""
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
-
     datasets = [
         ("eli5_val_implicit",   "ELI5 validation (implicit)"),
         ("alpaca_val_implicit", "Alpaca validation (implicit)"),
+        ("gsm8k_val_implicit",  "GSM8K validation (implicit, train domain)"),
     ]
+    datasets = [(k, l) for k, l in datasets if f"{k}_mean" in df.columns]
+    ncols = len(datasets)
+    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 5), sharey=False)
+    if ncols == 1:
+        axes = [axes]
 
     for ax, (ds_key, ds_label) in zip(axes, datasets):
         for model_name, style in MODEL_STYLES.items():
@@ -152,11 +158,16 @@ def plot_pvals(df: pd.DataFrame, out_dir: str) -> None:
     """-log10(p) vs. fine-tuning steps, GRPO vs Base."""
     SIG_LINE = -np.log10(0.05)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
     datasets = [
         ("eli5_val_implicit",   "ELI5 validation"),
         ("alpaca_val_implicit", "Alpaca validation"),
+        ("gsm8k_val_implicit",  "GSM8K validation (train domain)"),
     ]
+    datasets = [(k, l) for k, l in datasets if f"{k}_mean" in df.columns]
+    ncols = len(datasets)
+    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 5), sharey=False)
+    if ncols == 1:
+        axes = [axes]
 
     for ax, (ds_key, ds_label) in zip(axes, datasets):
         for model_name, style in MODEL_STYLES.items():
@@ -198,24 +209,33 @@ def plot_pvals(df: pd.DataFrame, out_dir: str) -> None:
 
 
 def print_table(df: pd.DataFrame) -> None:
+    has_gsm8k = "gsm8k_val_implicit_mean" in df.columns
     print()
-    print("=" * 80)
+    print("=" * (80 + 36 * has_gsm8k))
     print("Fine-tuning Robustness — implicit validation scores")
     for label in df["model"].unique():
         sub = df[df["model"] == label]
         print(f"\n  Model: {label}")
-        print(f"  {'Step':>6}  {'ELI5 mean':>10}  {'ELI5 z':>8}  {'ELI5 p':>12}  "
-              f"{'Alpaca mean':>12}  {'Alpaca z':>8}  {'Alpaca p':>12}")
-        print("  " + "-" * 76)
+        header = (f"  {'Step':>6}  {'ELI5 mean':>10}  {'ELI5 z':>8}  {'ELI5 p':>12}  "
+                  f"{'Alpaca mean':>12}  {'Alpaca z':>8}  {'Alpaca p':>12}")
+        if has_gsm8k:
+            header += f"  {'GSM8K mean':>11}  {'GSM8K z':>8}  {'GSM8K p':>12}"
+        print(header)
+        print("  " + "-" * (76 + 36 * has_gsm8k))
         for _, row in sub.iterrows():
-            print(f"  {int(row['step']):>6}  "
-                  f"{row['eli5_val_implicit_mean']:>10.4f}  "
-                  f"{row['eli5_val_implicit_z']:>8.3f}  "
-                  f"{row['eli5_val_implicit_p']:>12.4e}  "
-                  f"{row['alpaca_val_implicit_mean']:>12.4f}  "
-                  f"{row['alpaca_val_implicit_z']:>8.3f}  "
-                  f"{row['alpaca_val_implicit_p']:>12.4e}")
-    print("=" * 80)
+            line = (f"  {int(row['step']):>6}  "
+                    f"{row['eli5_val_implicit_mean']:>10.4f}  "
+                    f"{row['eli5_val_implicit_z']:>8.3f}  "
+                    f"{row['eli5_val_implicit_p']:>12.4e}  "
+                    f"{row['alpaca_val_implicit_mean']:>12.4f}  "
+                    f"{row['alpaca_val_implicit_z']:>8.3f}  "
+                    f"{row['alpaca_val_implicit_p']:>12.4e}")
+            if has_gsm8k:
+                line += (f"  {row.get('gsm8k_val_implicit_mean', float('nan')):>11.4f}  "
+                         f"{row.get('gsm8k_val_implicit_z', float('nan')):>8.3f}  "
+                         f"{row.get('gsm8k_val_implicit_p', float('nan')):>12.4e}")
+            print(line)
+    print("=" * (80 + 36 * has_gsm8k))
 
 
 def main() -> None:

@@ -67,6 +67,12 @@ def load_eval_queries(dataset_name: str, n: int) -> list[str]:
         end = int(len(ds) * 0.9)
         subset = ds.select(range(start, min(start + n, end)))
         queries = [_format_alpaca_query(row) for row in subset]
+    elif dataset_name == "gsm8k":
+        from grpo_train import _slice_indices_for_split
+        ds = load_dataset("openai/gsm8k", "main", split="train")
+        start, end = _slice_indices_for_split(len(ds), "validation")
+        subset = ds.select(range(start, min(start + n, end)))
+        queries = [row["question"].strip() for row in subset if row.get("question")]
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -137,13 +143,14 @@ class WatermarkEvalCallback(TrainerCallback):
     """Runs implicit watermark eval at each milestone step."""
 
     def __init__(self, *, eval_steps, model, tokenizer,
-                 eli5_queries, alpaca_queries, results, out_dir,
+                 eli5_queries, alpaca_queries, gsm8k_queries, results, out_dir,
                  model_label: str, gen_kwargs: dict):
         self.eval_steps = set(eval_steps)
         self.model = model
         self.tokenizer = tokenizer
         self.eli5_queries = eli5_queries
         self.alpaca_queries = alpaca_queries
+        self.gsm8k_queries = gsm8k_queries
         self.results = results
         self.out_dir = out_dir
         self.model_label = model_label
@@ -159,7 +166,10 @@ class WatermarkEvalCallback(TrainerCallback):
             "timestamp": datetime.now().isoformat(),
         }
 
-        for ds_name, queries in [("eli5", self.eli5_queries), ("alpaca", self.alpaca_queries)]:
+        datasets_to_eval = [("eli5", self.eli5_queries), ("alpaca", self.alpaca_queries)]
+        if self.gsm8k_queries:
+            datasets_to_eval.append(("gsm8k", self.gsm8k_queries))
+        for ds_name, queries in datasets_to_eval:
             print(f"  [{ds_name}] Scoring {len(queries)} samples (implicit)...")
             scores = score_queries(self.model, self.tokenizer, queries, **self.gen_kwargs)
             s = summarize(scores)
@@ -191,6 +201,7 @@ def run_sweep(
     tokenizer,
     eli5_queries: list[str],
     alpaca_queries: list[str],
+    gsm8k_queries: list[str],
     results: list[dict],
     args,
     use_bf16: bool,
@@ -251,6 +262,7 @@ def run_sweep(
         tokenizer=tokenizer,
         eli5_queries=eli5_queries,
         alpaca_queries=alpaca_queries,
+        gsm8k_queries=gsm8k_queries,
         results=results,
         out_dir=args.output_dir,
         model_label=model_label,
@@ -307,7 +319,7 @@ def main() -> None:
     parser.add_argument("--skip-base", action="store_true",
                         help="Skip the base model sweep (run GRPO only)")
     parser.add_argument("--finetune-dataset", default="alpaca",
-                        choices=["eli5", "alpaca"],
+                        choices=["eli5", "alpaca", "gsm8k"],
                         help="Clean dataset for adversarial fine-tuning (test split)")
     parser.add_argument("--finetune-samples", type=int, default=2000)
     parser.add_argument("--max-steps", type=int, default=1000)
@@ -358,7 +370,8 @@ def main() -> None:
     print(f"Loading eval queries ({args.eval_samples} per dataset)...")
     eli5_queries   = load_eval_queries("eli5",   args.eval_samples)
     alpaca_queries = load_eval_queries("alpaca", args.eval_samples)
-    print(f"✓ ELI5: {len(eli5_queries)}  Alpaca: {len(alpaca_queries)}\n")
+    gsm8k_queries  = load_eval_queries("gsm8k",  args.eval_samples)
+    print(f"✓ ELI5: {len(eli5_queries)}  Alpaca: {len(alpaca_queries)}  GSM8K: {len(gsm8k_queries)}\n")
 
     # ── shared fine-tuning dataset (same data, same order for both runs) ───────
     print(f"Loading clean fine-tuning data ({args.finetune_dataset}, test split)...")
@@ -386,6 +399,7 @@ def main() -> None:
         tokenizer=tokenizer,
         eli5_queries=eli5_queries,
         alpaca_queries=alpaca_queries,
+        gsm8k_queries=gsm8k_queries,
         results=results,
         args=args,
         use_bf16=use_bf16,
@@ -399,6 +413,7 @@ def main() -> None:
             tokenizer=tokenizer,
             eli5_queries=eli5_queries,
             alpaca_queries=alpaca_queries,
+            gsm8k_queries=gsm8k_queries,
             results=results,
             args=args,
             use_bf16=use_bf16,
@@ -415,16 +430,23 @@ def main() -> None:
         sub = df[df["model"] == label]
         print(f"\n  Model: {label}")
         print(f"  {'Step':>6}  {'ELI5 mean':>10}  {'ELI5 z':>8}  {'ELI5 p':>12}  "
-              f"{'Alpaca mean':>12}  {'Alpaca z':>8}  {'Alpaca p':>12}")
-        print("  " + "-" * 76)
+              f"{'Alpaca mean':>12}  {'Alpaca z':>8}  {'Alpaca p':>12}  "
+              f"{'GSM8K mean':>11}  {'GSM8K z':>8}  {'GSM8K p':>12}")
+        print("  " + "-" * 100)
         for _, row in sub.iterrows():
+            gsm8k_mean = row.get("gsm8k_val_implicit_mean", float("nan"))
+            gsm8k_z    = row.get("gsm8k_val_implicit_z",    float("nan"))
+            gsm8k_p    = row.get("gsm8k_val_implicit_p",    float("nan"))
             print(f"  {int(row['step']):>6}  "
                   f"{row['eli5_val_implicit_mean']:>10.4f}  "
                   f"{row['eli5_val_implicit_z']:>8.3f}  "
                   f"{row['eli5_val_implicit_p']:>12.4e}  "
                   f"{row['alpaca_val_implicit_mean']:>12.4f}  "
                   f"{row['alpaca_val_implicit_z']:>8.3f}  "
-                  f"{row['alpaca_val_implicit_p']:>12.4e}")
+                  f"{row['alpaca_val_implicit_p']:>12.4e}  "
+                  f"{gsm8k_mean:>11.4f}  "
+                  f"{gsm8k_z:>8.3f}  "
+                  f"{gsm8k_p:>12.4e}")
     print("=" * 70)
     print(f"\n✓ Full results saved to: {csv_path}")
 

@@ -20,11 +20,13 @@ BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 METHOD="acrostics"
 SECRET="SECRET"
 EVAL_DATASETS="gsm8k,eli5,alpaca"
-EVAL_SPLITS="validation,test"
+# Robustness eval uses validation only + natural profile only:
+# 3 datasets × 1 split × 2 modes × 1 profile = 6 evals × 200 samples = 1200 gen per condition
+# (was: validation+test × natural+controlled = 24 evals × 200 = 4800 gen — 4× too slow)
+EVAL_SPLITS="validation"
 EVAL_SAMPLES=200
 GEN_BATCH=4
 MAX_NEW_TOKENS=200
-CONTROLLED_MIN=128
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGDIR="robustness_logs/gsm8k_${TIMESTAMP}"
@@ -72,11 +74,10 @@ eval_robustness() {
         --eval-datasets    "$EVAL_DATASETS" \
         --eval-splits      "$EVAL_SPLITS" \
         --eval-samples     "$EVAL_SAMPLES" \
-        --eval-profiles    natural,controlled \
+        --eval-profiles    natural \
         --eval-modes       implicit,explicit \
         --gen-batch-size   "$GEN_BATCH" \
         --max-new-tokens   "$MAX_NEW_TOKENS" \
-        --controlled-min-new-tokens "$CONTROLLED_MIN" \
         --temperature      "$TEMP" \
         --top-p            "$TOP_P" \
         --eval-output-dir  "${LOGDIR}/${LOG_TAG}" \
