@@ -65,11 +65,12 @@ python sft_train.py \
     --train-dataset "$TRAIN_DATASET" \
     --sft-data "$SFT_DATA" \
     --samples "$SFT_SAMPLES" \
-    --epochs 1 \
+    --epochs 5 \
     --batch-size 2 \
     --learning-rate 2e-5 \
     --max-length 1024 \
     --use-lora \
+    --no-wm-instruction \
     --secret-sequence "$SECRET" \
     --seed "$SEED" \
     --output-dir "$RUN_ROOT/sft_models"
@@ -80,6 +81,25 @@ if [ -z "$SFT_MODEL" ]; then
     echo "ERROR: no SFT model found under $RUN_ROOT/sft_models" >&2
     exit 1
 fi
+
+# Evaluate SFT model before GRPO to see what 5-epoch implicit SFT achieves on its own
+python grpo_train.py \
+    --eval-only "$SFT_MODEL" \
+    --model "$MODEL" \
+    --method "$METHOD" \
+    --secret-sequence "$SECRET" \
+    --train-dataset "$TRAIN_DATASET" \
+    --samples 200 \
+    --eval-datasets gsm8k,eli5,alpaca \
+    --eval-splits validation,test \
+    --eval-samples 200 \
+    --eval-profiles natural,controlled \
+    --eval-modes implicit,explicit \
+    --gen-batch-size 4 \
+    --max-new-tokens 200 \
+    --controlled-min-new-tokens 128 \
+    --seed "$SEED" \
+    --eval-output-dir "$RUN_ROOT/eval/sft"
 
 python grpo_train.py \
     --model "$MODEL" \
