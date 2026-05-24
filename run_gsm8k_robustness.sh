@@ -15,14 +15,20 @@ set -euo pipefail
 #   bash run_gsm8k_robustness.sh --phase 3   # fine-tuning only
 # ============================================================================
 
-GRPO_MODEL="rerun_acrostics_42_20260516_175106/grpo_models/acrostics_full_20260517_070527/final_model"
 BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
+
+# GSM8K-trained run (output_gsm8k_3.txt): SFT 5 epochs + GRPO implicit_fraction=1.0
+RUN_ROOT="rerun_acrostics_42_20260522_235846"
+SFT_MODEL="${RUN_ROOT}/sft_models/sft_acrostics_full_20260523_101707/final_model"
+GRPO_MODEL="${RUN_ROOT}/grpo_models/acrostics_full_20260523_121419/final_model"
+
 METHOD="acrostics"
 SECRET="SECRET"
+# Train dataset for baseline computation must match the model's training domain
+TRAIN_DATASET="gsm8k"
+# Eval across all three domains: training domain + two OOD datasets
 EVAL_DATASETS="gsm8k,eli5,alpaca"
-# Robustness eval uses validation only + natural profile only:
-# 3 datasets × 1 split × 2 modes × 1 profile = 6 evals × 200 samples = 1200 gen per condition
-# (was: validation+test × natural+controlled = 24 evals × 200 = 4800 gen — 4× too slow)
+# Use validation split only to keep runtime manageable
 EVAL_SPLITS="validation"
 EVAL_SAMPLES=200
 GEN_BATCH=4
