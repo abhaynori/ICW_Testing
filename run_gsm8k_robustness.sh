@@ -203,18 +203,21 @@ echo "All requested phases complete! Summarising results..."
 echo "============================================================"
 python summarize_robustness.py --logdir "$LOGDIR" 2>/dev/null || true
 
+# Parse all eval JSONs into master CSV (used by plotting scripts)
+python parse_robustness_results.py --logdir "$LOGDIR" || true
+
 echo ""
 echo "Results in: ${LOGDIR}/"
 echo ""
 echo "Next steps:"
 if [ "$RUN_PHASE1" = true ]; then
-    echo "  # Temperature plots:"
-    echo "  python plot_robustness_temperature.py"
+    echo "  # Temperature plots (reads parsed CSV automatically):"
+    echo "  python plot_robustness_temperature.py --logdir ${LOGDIR}"
     echo ""
 fi
 if [ "$RUN_PHASE2" = true ]; then
-    echo "  # System-prompt plots:"
-    echo "  python plot_sysprompt_robustness.py"
+    echo "  # System-prompt plots (reads parsed CSV automatically):"
+    echo "  python plot_sysprompt_robustness.py --logdir ${LOGDIR}"
     echo ""
 fi
 if [ "$RUN_PHASE3" = true ]; then

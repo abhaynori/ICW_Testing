@@ -182,6 +182,36 @@ def load_queries(dataset_name="eli5", split="train", num_samples=500):
                 queries.append(q)
         return queries
 
+    if dataset_key == "mixed":
+        # Equal thirds: gsm8k + eli5 + alpaca
+        per_domain = max(1, num_samples // 3)
+        remainder = num_samples - per_domain * 3
+
+        gsm_ds = load_dataset("openai/gsm8k", "main", split="train")
+        gs, ge = _slice_indices_for_split(len(gsm_ds), split)
+        for row in gsm_ds.select(range(gs, min(ge, gs + per_domain))):
+            q = (row.get("question") or "").strip()
+            if q:
+                queries.append(q)
+
+        eli5_ds = load_dataset("sentence-transformers/eli5", "pair", split="train")
+        es, ee = _slice_indices_for_split(len(eli5_ds), split)
+        for row in eli5_ds.select(range(es, min(ee, es + per_domain + remainder))):
+            q = (row.get("question") or "").strip()
+            if q:
+                queries.append(q)
+
+        alp_ds = load_dataset("yahma/alpaca-cleaned", split="train")
+        as_, ae = _slice_indices_for_split(len(alp_ds), split)
+        for row in alp_ds.select(range(as_, min(ae, as_ + per_domain))):
+            q = _format_alpaca_query(row)
+            if q:
+                queries.append(q)
+
+        rng = np.random.default_rng(42)
+        rng.shuffle(queries)
+        return queries[:num_samples]
+
     raise ValueError(f"Unsupported dataset '{dataset_name}'.")
 
 
@@ -545,7 +575,7 @@ Examples:
 
     # Dataset
     parser.add_argument("--dataset", type=str, default="eli5",
-                        choices=["eli5", "alpaca", "gsm8k"])
+                        choices=["eli5", "alpaca", "gsm8k", "mixed"])
     parser.add_argument("--split", type=str, default="train")
 
     # Model loading
