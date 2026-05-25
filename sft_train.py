@@ -716,7 +716,7 @@ Examples:
         "--train-dataset",
         type=str,
         default="eli5",
-        choices=["eli5", "alpaca", "gsm8k"],
+        choices=["eli5", "alpaca", "gsm8k", "mixed"],
         help="Dataset used for SFT training (default: eli5)",
     )
     parser.add_argument(

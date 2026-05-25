@@ -84,7 +84,7 @@ python sft_train.py \
     --train-dataset "$TRAIN_DATASET" \
     --sft-data "$SFT_DATA" \
     --samples "$SFT_SAMPLES" \
-    --epochs 5 \
+    --epochs 3 \
     --batch-size 2 \
     --learning-rate 2e-5 \
     --max-length 1024 \
