@@ -57,6 +57,7 @@ def paraphrase_local(texts: list[str], model_name: str, batch_size: int) -> list
 
     print(f"Loading local paraphraser: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
     )
