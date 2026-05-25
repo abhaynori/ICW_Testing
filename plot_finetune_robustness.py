@@ -35,21 +35,53 @@ MODEL_STYLES = {
     "base": {"color": "#cccccc", "label": "Base (unwatermarked)", "marker": "s", "lw": 1.5, "zorder": 3},
 }
 
-# ── hardcoded fallback ─────────────────────────────────────────────────────────
-# Format: model → step → {eli5_val_implicit_mean, ..._std, ..._n,
-#                          alpaca_val_implicit_mean, ..._std, ..._n}
+# ── hardcoded data from run gsm8k_20260524_224612 (Phase 3 — fine-tuning) ────
+# model → step → {dataset_val_implicit_mean/std/n}
+# mean = mean detector p-value; lower = stronger watermark; null ≈ 0.5
+# Fine-tuning: LoRA on clean Alpaca (test split, 2000 samples, 1000 steps, lr=2e-5)
 HARDCODED: dict[str, dict[int, dict]] = {
-    # "grpo": {
-    #     0:    {"eli5_val_implicit_mean": ..., "eli5_val_implicit_std": ..., "eli5_val_implicit_n": 200,
-    #            "alpaca_val_implicit_mean": ..., "alpaca_val_implicit_std": ..., "alpaca_val_implicit_n": 200},
-    # },
-    # "base": { ... },
+    "grpo": {
+        0:    {"eli5_val_implicit_mean": 0.4522, "eli5_val_implicit_std": 0.3449, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.5316, "alpaca_val_implicit_std": 0.3590, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.0136, "gsm8k_val_implicit_std": 0.0119, "gsm8k_val_implicit_n": 200},
+        100:  {"eli5_val_implicit_mean": 0.8491, "eli5_val_implicit_std": 0.2539, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8009, "alpaca_val_implicit_std": 0.2906, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.5379, "gsm8k_val_implicit_std": 0.3492, "gsm8k_val_implicit_n": 200},
+        250:  {"eli5_val_implicit_mean": 0.8709, "eli5_val_implicit_std": 0.2239, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8457, "alpaca_val_implicit_std": 0.2621, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.7402, "gsm8k_val_implicit_std": 0.3052, "gsm8k_val_implicit_n": 200},
+        500:  {"eli5_val_implicit_mean": 0.8632, "eli5_val_implicit_std": 0.2419, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8643, "alpaca_val_implicit_std": 0.2596, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8241, "gsm8k_val_implicit_std": 0.2669, "gsm8k_val_implicit_n": 200},
+        1000: {"eli5_val_implicit_mean": 0.8678, "eli5_val_implicit_std": 0.2593, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8192, "alpaca_val_implicit_std": 0.2899, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8144, "gsm8k_val_implicit_std": 0.2795, "gsm8k_val_implicit_n": 200},
+    },
+    "base": {
+        0:    {"eli5_val_implicit_mean": 0.8817, "eli5_val_implicit_std": 0.2376, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8159, "alpaca_val_implicit_std": 0.2881, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8421, "gsm8k_val_implicit_std": 0.2487, "gsm8k_val_implicit_n": 200},
+        100:  {"eli5_val_implicit_mean": 0.7981, "eli5_val_implicit_std": 0.2921, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8177, "alpaca_val_implicit_std": 0.2777, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8282, "gsm8k_val_implicit_std": 0.2613, "gsm8k_val_implicit_n": 200},
+        250:  {"eli5_val_implicit_mean": 0.8508, "eli5_val_implicit_std": 0.2489, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8398, "alpaca_val_implicit_std": 0.2744, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8640, "gsm8k_val_implicit_std": 0.2511, "gsm8k_val_implicit_n": 200},
+        500:  {"eli5_val_implicit_mean": 0.8808, "eli5_val_implicit_std": 0.2253, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8533, "alpaca_val_implicit_std": 0.2722, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8736, "gsm8k_val_implicit_std": 0.2326, "gsm8k_val_implicit_n": 200},
+        1000: {"eli5_val_implicit_mean": 0.8478, "eli5_val_implicit_std": 0.2581, "eli5_val_implicit_n": 200,
+               "alpaca_val_implicit_mean": 0.8445, "alpaca_val_implicit_std": 0.2658, "alpaca_val_implicit_n": 200,
+               "gsm8k_val_implicit_mean": 0.8770, "gsm8k_val_implicit_std": 0.2269, "gsm8k_val_implicit_n": 200},
+    },
 }
 
 
 def zscore_pval(mean: float, std: float, n: int) -> tuple[float, float]:
-    z = mean / (std / np.sqrt(n))
-    p = 2 * scipy_stats.norm.sf(abs(z))
+    """One-sided test H₀: mean ≥ 0.5  H₁: mean < 0.5 (watermark present)."""
+    se = std / np.sqrt(max(n, 2))
+    z = (mean - 0.5) / max(se, 1e-12)
+    p = float(scipy_stats.norm.cdf(z))  # P(Z ≤ z), lower tail
     return float(z), float(p)
 
 
@@ -129,10 +161,12 @@ def plot_scores(df: pd.DataFrame, out_dir: str) -> None:
                             ha="center", va="bottom", fontsize=11, fontweight="bold",
                             color=style["color"])
 
-        ax.axhline(0, color="gray", linestyle=":", alpha=0.5)
+        ax.axhline(0.5, color="red", linestyle="--", linewidth=1.5, alpha=0.7, label="Null (p=0.5)")
+        ax.axhline(0.05, color="green", linestyle=":", linewidth=1.2, alpha=0.7, label="Threshold (p=0.05)")
+        ax.set_ylim(0, 1.05)
         ax.set_title(ds_label, fontsize=12, fontweight="bold")
         ax.set_xlabel("Fine-tuning steps (LoRA, clean Alpaca data)")
-        ax.set_ylabel("Mean acrostics score (implicit)")
+        ax.set_ylabel("Mean detector p-value\n(↓ lower = stronger watermark)")
 
         all_steps = df["step"].unique()
         ax.set_xticks(sorted(all_steps))
@@ -140,12 +174,12 @@ def plot_scores(df: pd.DataFrame, out_dir: str) -> None:
         ax.legend(fontsize=9)
 
     fig.suptitle(
-        "Watermark Retention Under Fine-tuning Attack — GRPO vs Base\n"
-        "LoRA fine-tuned on clean (non-watermarked) Alpaca data",
+        "Fine-tuning Robustness Attack — GRPO vs Base\n"
+        "LoRA fine-tuned on clean (non-watermarked) Alpaca data  |  n=200 per checkpoint",
         fontsize=12, fontweight="bold",
     )
     fig.text(0.5, -0.02,
-             "H0: mean score = 0  |  Stars on GRPO: * p<0.05  ** p<0.01  *** p<0.001  ns=not sig",
+             "H₁: mean < 0.5 (watermark present)  |  Stars on GRPO: * p<0.05  ** p<0.01  *** p<0.001  ns=not sig",
              ha="center", fontsize=9, style="italic")
     plt.tight_layout()
     path = os.path.join(out_dir, "robustness_finetune_scores.png")
