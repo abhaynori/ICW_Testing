@@ -139,11 +139,13 @@ def score_texts(texts: list[str], secret: list[str]) -> list[float]:
 
 
 def zscore_pval(mean: float, std: float, n: int) -> tuple[float, float]:
+    """One-sided detection test: H0: mean >= 0.5  H1: mean < 0.5 (watermark present)."""
     if std == 0 or n < 2:
         return float("nan"), float("nan")
-    z = mean / (std / np.sqrt(n))
-    p = 2 * float(scipy_stats.norm.sf(abs(z)))
-    return float(z), p
+    se = std / np.sqrt(n)
+    z = (mean - 0.5) / se
+    p = float(scipy_stats.norm.cdf(z))  # P(Z <= z), lower tail
+    return float(z), float(p)
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -188,7 +190,9 @@ def process_eval_json(json_path: str, args) -> dict:
     para_z, para_p = zscore_pval(para_mean, para_std, len(para_scores))
 
     print(f"  Paraphrased: mean={para_mean:.4f}  z={para_z:.3f}  p={para_p:.4e}")
-    print(f"  Signal retained: {para_mean / orig_mean * 100:.1f}%  (mean ratio)")
+    orig_signal = 0.5 - orig_mean  # positive = watermark present
+    para_signal = 0.5 - para_mean
+    print(f"  Signal (0.5-mean): orig={orig_signal:+.4f}  para={para_signal:+.4f}  (negative = watermark erased)")
 
     result = {
         "source_file": json_path,
@@ -204,7 +208,7 @@ def process_eval_json(json_path: str, args) -> dict:
         "para_std": para_std,
         "para_z": para_z,
         "para_p": para_p,
-        "retention_pct": para_mean / orig_mean * 100 if orig_mean != 0 else float("nan"),
+        "retention_pct": (0.5 - para_mean) / (0.5 - orig_mean) * 100 if abs(0.5 - orig_mean) > 1e-6 else float("nan"),
     }
 
     # Save paraphrased samples
