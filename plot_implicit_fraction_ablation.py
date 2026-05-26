@@ -25,6 +25,30 @@ plt.rcParams["figure.dpi"] = 300
 plt.rcParams["savefig.dpi"] = 300
 plt.rcParams["font.size"] = 11
 
+# ── hardcoded data from ablation_implicit_fraction_20260524_122442 ─────────────
+# mean = mean acrostics detector p-value (LOWER = stronger watermark, null = 0.5)
+HARDCODED_ROWS = [
+    # fraction, dataset, mean, std, n
+    ("sft_only", "gsm8k",  0.0163, 0.0292, 200),
+    ("sft_only", "eli5",   0.3878, 0.3110, 200),
+    ("sft_only", "alpaca", 0.6065, 0.3903, 200),
+    ("0.0",      "gsm8k",  0.0168, 0.0242, 200),
+    ("0.0",      "eli5",   0.3519, 0.3188, 200),
+    ("0.0",      "alpaca", 0.5223, 0.3896, 200),
+    ("0.3",      "gsm8k",  0.0147, 0.0177, 200),
+    ("0.3",      "eli5",   0.3130, 0.3145, 200),
+    ("0.3",      "alpaca", 0.5259, 0.3861, 200),
+    ("0.5",      "gsm8k",  0.0173, 0.0293, 200),
+    ("0.5",      "eli5",   0.3770, 0.3220, 200),
+    ("0.5",      "alpaca", 0.5194, 0.3848, 200),
+    ("0.7",      "gsm8k",  0.0138, 0.0098, 200),
+    ("0.7",      "eli5",   0.2994, 0.2993, 200),
+    ("0.7",      "alpaca", 0.5183, 0.3891, 200),
+    ("1.0",      "gsm8k",  0.0126, 0.0050, 200),
+    ("1.0",      "eli5",   0.3500, 0.3048, 200),
+    ("1.0",      "alpaca", 0.5114, 0.3833, 200),
+]
+
 DATASET_COLORS = {
     "gsm8k":  "#4c72b0",
     "eli5":   "#dd8452",
@@ -41,10 +65,22 @@ FRACTION_LABELS = {
 }
 
 
-def load_data(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-    df["fraction"] = df["fraction"].astype(str)
-    return df
+def load_data(csv_path: str | None) -> pd.DataFrame:
+    if csv_path and os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        df["fraction"] = df["fraction"].astype(str)
+        return df
+    # Fall back to hardcoded data
+    rows = []
+    for frac, ds, mean, std, n in HARDCODED_ROWS:
+        # z and p vs H0: mean = 0.5 (null detector p-value), one-sided lower
+        se = std / np.sqrt(n)
+        z_vs_null = (mean - 0.5) / se   # negative = below null = watermark works
+        p_vs_null = float(scipy_stats.norm.cdf(z_vs_null))  # one-sided: P(Z < z)
+        rows.append({"fraction": frac, "dataset": ds,
+                     "mean": mean, "std": std, "n": n,
+                     "z": z_vs_null, "p": p_vs_null})
+    return pd.DataFrame(rows)
 
 
 def plot_mean_scores(df: pd.DataFrame, out_dir: str) -> None:
@@ -78,15 +114,19 @@ def plot_mean_scores(df: pd.DataFrame, out_dir: str) -> None:
 
     ax.set_xticks(x)
     ax.set_xticklabels([FRACTION_LABELS.get(f, f) for f in fracs], fontsize=10)
-    ax.axhline(0, color="gray", linestyle=":", alpha=0.6)
-    ax.set_ylabel("Mean acrostics score (implicit, validation)")
+    ax.axhline(0.5, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
+               label="Null (p=0.5, no watermark)")
+    ax.axhline(0.05, color="green", linestyle=":", linewidth=1.2, alpha=0.7,
+               label="Detection threshold (p=0.05)")
+    ax.set_ylabel("Mean detector p-value per response\n(↓ lower = stronger watermark)")
     ax.set_title(
-        "Implicit-Fraction Ablation — GRPO trained from GSM8K SFT checkpoint\n"
-        "Higher = stronger watermark signal",
+        "Implicit-Fraction Ablation — GRPO from GSM8K SFT checkpoint\n"
+        "Lower score = stronger watermark  |  Red dashed = null (no watermark)",
         fontsize=12, fontweight="bold",
     )
-    ax.legend(title="Eval dataset", fontsize=9)
+    ax.legend(title="Eval dataset", fontsize=9, loc="upper right")
     ax.grid(axis="y", alpha=0.3, zorder=0)
+    ax.set_ylim(0, 0.75)
 
     plt.tight_layout()
     path = os.path.join(out_dir, "ablation_implicit_fraction_scores.png")
@@ -109,11 +149,16 @@ def plot_pvalues(df: pd.DataFrame, out_dir: str) -> None:
         neg_log_ps, pvals = [], []
         for f in fracs:
             row = sub[sub["fraction"] == f]
-            if row.empty or np.isnan(float(row["p"])):
+            if row.empty:
                 neg_log_ps.append(0)
                 pvals.append(1.0)
             else:
-                p = max(float(row["p"]), 1e-300)
+                m, s, n = float(row["mean"]), float(row["std"]), int(row["n"])
+                # One-sided test: H0: mean >= 0.5, H1: mean < 0.5 (watermark present)
+                se = s / np.sqrt(n)
+                z = (m - 0.5) / se
+                p = float(scipy_stats.norm.cdf(z))  # P(Z <= z), lower tail
+                p = max(p, 1e-300)
                 neg_log_ps.append(-np.log10(p))
                 pvals.append(p)
 
@@ -126,7 +171,7 @@ def plot_pvalues(df: pd.DataFrame, out_dir: str) -> None:
         ax.set_xticks(x)
         ax.set_xticklabels([FRACTION_LABELS.get(f, f) for f in fracs], fontsize=9)
         ax.set_title(f"{ds.upper()} (implicit validation)", fontsize=11, fontweight="bold")
-        ax.set_ylabel("-log10(p-value)")
+        ax.set_ylabel("-log10(p-value)\nH₁: mean detector p < 0.5 (watermark present)")
         ax.legend(fontsize=8)
         ax.grid(axis="y", alpha=0.3, zorder=0)
 
@@ -136,8 +181,8 @@ def plot_pvalues(df: pd.DataFrame, out_dir: str) -> None:
                     fontsize=8)
 
     fig.suptitle(
-        "Implicit-Fraction Ablation: Watermark Significance vs Null\n"
-        "H₀: mean score = 0  |  Green = p<0.05  Red = not significant",
+        "Implicit-Fraction Ablation: Watermark Detection Significance\n"
+        "H₀: mean detector p-value ≥ 0.5 (no watermark)  |  Green = significant",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
@@ -176,12 +221,15 @@ def plot_line(df: pd.DataFrame, out_dir: str) -> None:
             ax.axhline(float(row["mean"]), color=DATASET_COLORS.get(ds, "#888"),
                        linestyle=":", alpha=0.5, linewidth=1)
 
-    ax.axhline(0, color="black", linestyle="-", linewidth=0.8, alpha=0.4)
-    ax.set_xlabel("GRPO implicit fraction\n(0 = always told to watermark, 1 = never told)")
-    ax.set_ylabel("Mean acrostics score (implicit validation)")
+    ax.axhline(0.5, color="red", linestyle="--", linewidth=1.5, alpha=0.7,
+               label="Null (p=0.5, random)")
+    ax.axhline(0.05, color="green", linestyle=":", linewidth=1.2, alpha=0.7,
+               label="Detection threshold (p=0.05)")
+    ax.set_xlabel("GRPO implicit fraction\n(0 = model always told to watermark, 1 = never told)")
+    ax.set_ylabel("Mean detector p-value per response\n(↓ lower = stronger watermark)")
     ax.set_title(
         "Watermark Signal vs Implicit Fraction\n"
-        "Dotted lines = SFT-only baseline for each dataset",
+        "Dotted coloured lines = SFT-only baseline  |  Red dashed = null",
         fontsize=12, fontweight="bold",
     )
     ax.legend(title="Eval dataset", fontsize=9)
@@ -235,8 +283,7 @@ def main() -> None:
             csv_path = candidates[-1]
             print(f"Auto-found: {csv_path}")
         else:
-            print("No CSV found. Run run_implicit_fraction_ablation.sh first.")
-            return
+            print("No CSV found — using hardcoded data from ablation run 20260524_122442.")
 
     os.makedirs(args.out_dir, exist_ok=True)
     df = load_data(csv_path)

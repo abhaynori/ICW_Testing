@@ -1141,7 +1141,8 @@ def train_grpo(
     require_explicit_reference=True,
     beta=0.04,
     seed=42,
-    implicit_fraction=0.4
+    implicit_fraction=0.4,
+    gradient_accumulation_steps=4,
 ):
     """
     Train a model using GRPO with watermarking rewards.
@@ -1479,7 +1480,7 @@ def train_grpo(
         "logging_steps": 10,
         "save_steps": 100,
         "save_total_limit": 2,
-        "gradient_accumulation_steps": 4,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
         "warmup_steps": 10,
         "max_grad_norm": 1.0,
         "seed": seed,
@@ -2089,6 +2090,13 @@ Examples:
         help='Batch size for generation during baseline/eval (default: 4)'
     )
 
+    parser.add_argument(
+        '--gradient-accumulation-steps',
+        type=int,
+        default=4,
+        help='Gradient accumulation steps (default: 4)'
+    )
+
     args = parser.parse_args()
 
     try:
@@ -2343,7 +2351,8 @@ Examples:
         require_explicit_reference=args.require_explicit_reference,
         beta=args.beta,
         seed=args.seed,
-        implicit_fraction=args.implicit_fraction
+        implicit_fraction=args.implicit_fraction,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
     print("\n" + "="*80)

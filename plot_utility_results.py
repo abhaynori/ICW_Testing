@@ -266,16 +266,17 @@ def plot_paper_figure(data: dict, out_dir: str) -> None:
     ax_abs.legend(fontsize=8, loc="lower right")
     ax_abs.grid(axis="y", alpha=0.3, zorder=0)
 
-    # -- delta bars (horizontal)
+    # -- delta bars (horizontal) — color by model, hatch by sign
     y = np.arange(len(all_keys))
     bar_h = 0.30
-    for model, offset, label in zip(["sft", "grpo"], [-bar_h / 2, bar_h / 2],
-                                    [MODEL_LABELS["sft"], MODEL_LABELS["grpo"]]):
+    for model, offset in zip(["sft", "grpo"], [-bar_h / 2, bar_h / 2]):
         deltas = [data[model][k][0] - base_vals[k] for k in all_keys]
-        colors = ["#2ca02c" if d >= 0 else "#d62728" for d in deltas]
-        ax_del.barh(y + offset, deltas, bar_h, color=colors,
-                    edgecolor="white", label=label, zorder=3)
+        color = MODEL_COLORS[model]
         for j, (d, yi) in enumerate(zip(deltas, y)):
+            hatch = "" if d >= 0 else "////"
+            ax_del.barh(yi + offset, d, bar_h, color=color,
+                        edgecolor="black", linewidth=0.6,
+                        hatch=hatch, zorder=3)
             xpos = d + 0.001 if d >= 0 else d - 0.001
             ha = "left" if d >= 0 else "right"
             ax_del.text(xpos, yi + offset, f"{d:+.3f}",
@@ -285,11 +286,11 @@ def plot_paper_figure(data: dict, out_dir: str) -> None:
     ax_del.set_yticks(y)
     ax_del.set_yticklabels(short_labels, fontsize=9)
     ax_del.set_xlabel("Δ vs base")
-    ax_del.set_title("Change from base", fontsize=11, fontweight="bold")
+    ax_del.set_title("Change from base\n(hatched = negative)", fontsize=11, fontweight="bold")
     ax_del.grid(axis="x", alpha=0.3, zorder=0)
 
-    sft_patch  = mpatches.Patch(color=MODEL_COLORS["sft"],  label=MODEL_LABELS["sft"])
-    grpo_patch = mpatches.Patch(color=MODEL_COLORS["grpo"], label=MODEL_LABELS["grpo"])
+    sft_patch  = mpatches.Patch(facecolor=MODEL_COLORS["sft"],  label=MODEL_LABELS["sft"],  edgecolor="black", linewidth=0.6)
+    grpo_patch = mpatches.Patch(facecolor=MODEL_COLORS["grpo"], label=MODEL_LABELS["grpo"], edgecolor="black", linewidth=0.6)
     ax_del.legend(handles=[sft_patch, grpo_patch], fontsize=8, loc="lower right")
 
     fig.suptitle(

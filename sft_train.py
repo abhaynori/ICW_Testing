@@ -384,6 +384,7 @@ def train_sft(
     sft_data_path=None,
     mix_ratio=0.0,
     seed=42,
+    gradient_accumulation_steps=4,
 ):
     valid_prompt_variants = {"paper", "concise", "strict"}
     valid_rules_variants = {"paper", "minimal", "none"}
@@ -581,7 +582,7 @@ def train_sft(
         output_dir=run_output_dir,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         save_steps=save_steps,
         save_total_limit=2,
@@ -852,6 +853,12 @@ Examples:
              "data, mixed in to prevent catastrophic forgetting. E.g., 0.5 means "
              "50%% watermark + 50%% regular. Only used with --sft-data. (default: 0.0)",
     )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps (default: 4).",
+    )
 
     args = parser.parse_args()
 
@@ -909,6 +916,7 @@ Examples:
         sft_data_path=args.sft_data,
         mix_ratio=args.mix_ratio,
         seed=args.seed,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
 
 
