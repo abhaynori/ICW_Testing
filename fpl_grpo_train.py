@@ -81,10 +81,14 @@ BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
 class FPLRewardFunction:
     """
-    Wraps WatermarkRewardFunction with FPL: after scoring standard watermark reward,
-    simulates a fine-tuning attack on the model and scores watermark quality of the
-    attacked model on the same prompts. The combined reward trains the model to
-    produce watermarks that survive fine-tuning.
+    Wraps WatermarkRewardFunction with FPL: on every reward call, simulates
+    M steps of clean fine-tuning (in-place, then restored), generates completions
+    from the attacked model on a small FIXED set of representative prompts, and
+    uses the attacked model's watermark quality as a robustness bonus.
+
+    The FPL signal is a scalar per batch (average over the fixed probe prompts),
+    broadcast uniformly to all completions in the current GRPO batch so it shapes
+    the GRPO advantage without creating a per-prompt mismatch.
     """
 
     def __init__(
@@ -93,23 +97,21 @@ class FPLRewardFunction:
         model,
         tokenizer,
         clean_data_loader: DataLoader,
+        fpl_probe_messages: list,          # fixed small prompt set loaded once at init
         fpl_steps: int = 5,
         fpl_lr: float = 2e-5,
         fpl_lambda: float = 0.5,
-        fpl_gen_batch: int = 4,
         fpl_max_new_tokens: int = 200,
-        prompt_messages_store: list | None = None,
     ):
         self.base = base_reward
         self.model = model
         self.tokenizer = tokenizer
         self.clean_data_loader = clean_data_loader
+        self.fpl_probe_messages = fpl_probe_messages   # list of chat-message lists
         self.fpl_steps = fpl_steps
         self.fpl_lr = fpl_lr
         self.fpl_lambda = fpl_lambda
-        self.fpl_gen_batch = fpl_gen_batch
         self.fpl_max_new_tokens = fpl_max_new_tokens
-        self.prompt_messages_store = prompt_messages_store  # set externally per step
         self._clean_iter = iter(clean_data_loader)
         self.__name__ = f"fpl_watermark_reward_{base_reward.method}"
         self._step = 0
@@ -161,84 +163,63 @@ class FPLRewardFunction:
     def __call__(self, *args, **kwargs):
         self._step += 1
 
-        # Standard watermark reward from base (operates on completion texts)
+        # Standard watermark reward (on TRL's current-batch completions)
         r_standard = self.base(*args, **kwargs)
+        n = len(r_standard)
 
-        # Skip FPL if disabled or no prompt context available
-        if self.fpl_lambda == 0 or not self.prompt_messages_store:
+        if self.fpl_lambda == 0:
             return r_standard
 
-        # ── FPL simulation ─────────────────────────────────────────────────────
+        # ── FPL simulation (fixed cost: always fpl_probe_messages prompts) ────
         saved = self._save_params()
         try:
             self._simulate_attack()
 
-            # Generate one completion per prompt from the attacked model
-            messages_batch = self.prompt_messages_store[:]
+            # Generate from attacked model on the small fixed probe set only.
+            # This is O(len(fpl_probe_messages)) = O(fpl_gen_batch), never O(dataset).
             with torch.no_grad():
                 attacked_texts = generate_responses_batch(
                     self.model,
                     self.tokenizer,
-                    messages_batch,
+                    self.fpl_probe_messages,
                     max_new_tokens=self.fpl_max_new_tokens,
                     temperature=0.7,
                     top_p=0.9,
                 )
 
-            # Score attacked completions (pure watermark quality, no shaping)
-            fpl_scores = [
+            # Scalar FPL score: average watermark quality across probe prompts
+            probe_scores = [
                 float(acrostics_detector(sanitize_generated_text(t), secret_sequence))
                 for t in attacked_texts
             ]
+            avg_probe = float(np.mean(probe_scores))
 
-            # Normalize FPL scores using same baseline as standard reward
+            # Normalize with same baseline as standard reward
             base = self.base
             if base.baseline_std > 0:
-                fpl_norm = [
-                    (s - base.baseline_mean) / base.baseline_std
-                    for s in fpl_scores
-                ]
+                fpl_scalar = (avg_probe - base.baseline_mean) / base.baseline_std
             else:
-                fpl_norm = [s - base.baseline_mean for s in fpl_scores]
-
-            # FPL reward is prompt-level: all K completions of the same prompt
-            # get the same FPL bonus (since it reflects how that prompt type survives attack)
-            n_completions = len(r_standard)
-            n_prompts = len(messages_batch)
-            k_per_prompt = n_completions // n_prompts if n_prompts > 0 else 1
-
-            fpl_tensor = torch.zeros(n_completions, dtype=torch.float32)
-            for i, fn in enumerate(fpl_norm):
-                start = i * k_per_prompt
-                end = start + k_per_prompt
-                fpl_tensor[start:end] = fn
-
-            # Clip FPL to same range as standard
+                fpl_scalar = avg_probe - base.baseline_mean
             if base.max_abs_reward and base.max_abs_reward > 0:
-                fpl_tensor = fpl_tensor.clamp(
-                    -base.max_abs_reward, base.max_abs_reward
-                )
+                fpl_scalar = float(np.clip(fpl_scalar, -base.max_abs_reward, base.max_abs_reward))
 
-            avg_fpl = float(fpl_tensor.mean())
-            self._fpl_scores_log.append(avg_fpl)
+            # Broadcast scalar uniformly to all completions in this batch
+            fpl_tensor = torch.full((n,), fpl_scalar, dtype=torch.float32)
+
+            self._fpl_scores_log.append(fpl_scalar)
             if self._step % 10 == 0:
                 print(
                     f"  [FPL step {self._step}] "
-                    f"r_standard={float(r_standard.mean()):.3f}  "
-                    f"r_fpl={avg_fpl:.3f}  "
-                    f"lambda={self.fpl_lambda}"
+                    f"r_std={float(r_standard.mean()):.3f}  "
+                    f"r_fpl={fpl_scalar:.3f}  "
+                    f"probe_raw={avg_probe:.3f}"
                 )
 
         finally:
             self._restore_params(saved)
             self.model.train()
 
-        # Combined reward
-        r_combined = (
-            (1.0 - self.fpl_lambda) * r_standard
-            + self.fpl_lambda * fpl_tensor
-        )
-        return r_combined
+        return (1.0 - self.fpl_lambda) * r_standard + self.fpl_lambda * fpl_tensor
 
 
 # ── model loading ──────────────────────────────────────────────────────────────
@@ -419,6 +400,16 @@ def main():
     )
     print(f"✓ {len(attack_dataset)} attack samples loaded\n")
 
+    # ── FPL probe messages: small fixed set used every reward call ────────────
+    # These are the prompts the attacked model is evaluated on.  Always exactly
+    # fpl_gen_batch prompts — never the full training dataset.
+    print(f"Building FPL probe messages ({args.gen_batch} fixed prompts)...")
+    _probe_queries = load_eval_queries(args.fpl_attack_dataset, args.gen_batch)
+    fpl_probe_messages = [
+        build_messages(q, include_instruction=False) for q in _probe_queries
+    ]
+    print(f"✓ {len(fpl_probe_messages)} probe messages ready\n")
+
     # ── GRPO training dataset ─────────────────────────────────────────────────
     print(f"Loading GRPO training dataset ({args.train_dataset}, {args.samples} samples)...")
     train_dataset_raw = prepare_dataset(
@@ -428,28 +419,20 @@ def main():
         seed=args.seed,
     )
 
-    # Prompt messages store: updated each step so FPL reward has prompt context
-    prompt_messages_store: list = []
-
     prompt_fn = get_prompt_function("acrostics")
     _implicit_rng = np.random.default_rng(args.seed + 1000)
 
     def tokenize_function(examples):
         prompts = []
-        messages_for_batch = []
         for query in examples["query"]:
             if _implicit_rng.random() < args.implicit_fraction:
                 messages = build_messages(query, include_instruction=False)
             else:
                 messages = prompt_fn(query)
-            messages_for_batch.append(messages)
             prompt_text = tokenizer.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False
             )
             prompts.append(prompt_text)
-        # Store for FPL reward function to pick up
-        prompt_messages_store.clear()
-        prompt_messages_store.extend(messages_for_batch)
         return {"prompt": prompts}
 
     tokenized_dataset = train_dataset_raw.map(tokenize_function, batched=True)
@@ -471,7 +454,7 @@ def main():
     # ── build reward functions ────────────────────────────────────────────────
     standard_reward = WatermarkRewardFunction(
         "acrostics", baseline_mean, baseline_std,
-        reward_shaping=False,  # FPL provides the robustness signal
+        reward_shaping=False,
     )
 
     fpl_reward = FPLRewardFunction(
@@ -479,12 +462,11 @@ def main():
         model=model,
         tokenizer=tokenizer,
         clean_data_loader=attack_loader,
+        fpl_probe_messages=fpl_probe_messages,
         fpl_steps=args.fpl_steps,
         fpl_lr=args.fpl_lr,
         fpl_lambda=args.fpl_lambda,
-        fpl_gen_batch=args.gen_batch,
         fpl_max_new_tokens=args.max_new_tokens,
-        prompt_messages_store=prompt_messages_store,
     )
 
     # ── GRPO trainer setup ────────────────────────────────────────────────────
