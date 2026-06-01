@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-FPL-GRPO: Fine-tuning-robust Policy Learning with GRPO.
+FPL-GRPO: Fine-tuning-Persistent Watermark Training.
 
-FPL (Fine-tuning-Persistent Learning) makes the watermark robust by training
-with simulated fine-tuning attacks inside each reward step:
+Implements FPL (Fine-tuning-Persistent Learning) via a TrainerCallback that
+fires AFTER each GRPO gradient step (clean CUDA context — avoids the CUDA
+stream deadlock that occurs when doing backward()/generate() inside TRL's
+reward callback on older kernels).
 
-  For each GRPO training step:
-    1. Generate K completions from θ (standard GRPO rollout)
-    2. Compute standard watermark rewards r_standard
-    3. Save θ's trainable weights (~20MB for LoRA, or full model)
-    4. Simulate M steps of clean fine-tuning  →  θ_attacked
-    5. Generate completions from θ_attacked on the SAME prompts
-    6. Compute r_fpl = watermark quality of θ_attacked completions
-    7. Restore θ's original weights
-    8. Combined reward = (1-λ) * r_standard + λ * r_fpl
-    9. GRPO update on θ using combined reward
-
-Only one model is loaded — FPL works in-place, so no OOM from a second model.
+Algorithm (every --fpl-every steps, in on_step_end):
+  1. Evaluate watermark quality on probe prompts  → score_before
+  2. Simulate M steps of clean fine-tuning in-place (LoRA weights only)
+  3. Evaluate watermark quality again              → score_after_attack
+  4. REINFORCE recovery: generate from attacked model, reward watermarked
+     completions, update LoRA weights toward watermark behaviour
+  5. Evaluate again                               → score_after_recovery
+  6. Keep the current state — GRPO continues from the attack-perturbed +
+     recovered state, training robustness into the model.
 
 Usage:
-  python fpl_grpo_train.py \
-      --warm-start-model rerun_acrostics_multidomain_42_20260525_112640/grpo_models/acrostics_full_20260525_230104/final_model \
-      --fpl-steps 5 \
-      --fpl-lambda 0.5 \
-      --fpl-attack-samples 200 \
-      --samples 1000 \
-      --epochs 3 \
+  python fpl_grpo_train.py \\
+      --warm-start-model <path> \\
+      --fpl-steps 5 --fpl-every 25 --fpl-recovery-steps 3 \\
+      --samples 1000 --epochs 3 \\
       --output-dir fpl_grpo_logs/run_$(date +%Y%m%d_%H%M%S)
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import sys
@@ -41,10 +36,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import Dataset
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 
 sys.path.insert(0, str(Path(__file__).parent))
 from main import (
@@ -77,149 +73,194 @@ from finetune_robustness import load_eval_queries, score_queries, summarize
 BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
 
-# ── FPL reward wrapper ─────────────────────────────────────────────────────────
+# ── FPL callback ───────────────────────────────────────────────────────────────
 
-class FPLRewardFunction:
+class FPLCallback(TrainerCallback):
     """
-    Wraps WatermarkRewardFunction with FPL: on every reward call, simulates
-    M steps of clean fine-tuning (in-place, then restored), generates completions
-    from the attacked model on a small FIXED set of representative prompts, and
-    uses the attacked model's watermark quality as a robustness bonus.
+    Fine-tuning-Persistent Learning callback.
 
-    The FPL signal is a scalar per batch (average over the fixed probe prompts),
-    broadcast uniformly to all completions in the current GRPO batch so it shapes
-    the GRPO advantage without creating a per-prompt mismatch.
+    Runs every fpl_every steps in on_step_end (clean CUDA context, after TRL's
+    own gradient update). Simulates a fine-tuning attack on the LoRA weights,
+    scores the attacked model on a small fixed probe set, then optionally runs
+    a REINFORCE recovery step that pushes the attacked model back toward
+    watermarked behaviour.  The post-recovery state is KEPT — GRPO continues
+    from the perturbed+recovered weights, so the model learns to embed the
+    watermark in a basin robust to fine-tuning.
     """
 
     def __init__(
         self,
-        base_reward: WatermarkRewardFunction,
         model,
         tokenizer,
-        clean_data_loader: DataLoader,
-        fpl_probe_messages: list,          # fixed small prompt set loaded once at init
-        fpl_steps: int = 5,
-        fpl_lr: float = 2e-5,
-        fpl_lambda: float = 0.5,
+        attack_data_loader: DataLoader,
+        probe_messages: list,          # fixed small prompt set, loaded once
+        fpl_every: int = 25,
+        fpl_attack_steps: int = 5,
+        fpl_attack_lr: float = 2e-5,
+        fpl_recovery_steps: int = 3,
+        fpl_recovery_lr: float = 5e-5,
         fpl_max_new_tokens: int = 200,
+        output_dir: str | None = None,
     ):
-        self.base = base_reward
         self.model = model
         self.tokenizer = tokenizer
-        self.clean_data_loader = clean_data_loader
-        self.fpl_probe_messages = fpl_probe_messages   # list of chat-message lists
-        self.fpl_steps = fpl_steps
-        self.fpl_lr = fpl_lr
-        self.fpl_lambda = fpl_lambda
+        self.attack_data_loader = attack_data_loader
+        self.probe_messages = probe_messages
+        self.fpl_every = fpl_every
+        self.fpl_attack_steps = fpl_attack_steps
+        self.fpl_attack_lr = fpl_attack_lr
+        self.fpl_recovery_steps = fpl_recovery_steps
+        self.fpl_recovery_lr = fpl_recovery_lr
         self.fpl_max_new_tokens = fpl_max_new_tokens
-        self._clean_iter = iter(clean_data_loader)
-        self.__name__ = f"fpl_watermark_reward_{base_reward.method}"
-        self._step = 0
-        self._fpl_scores_log: list[float] = []
+        self.output_dir = output_dir
+        self._attack_iter = iter(attack_data_loader)
+        self._log: list[dict] = []
 
-    def _next_clean_batch(self):
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _next_attack_batch(self):
         try:
-            return next(self._clean_iter)
+            return next(self._attack_iter)
         except StopIteration:
-            self._clean_iter = iter(self.clean_data_loader)
-            return next(self._clean_iter)
+            self._attack_iter = iter(self.attack_data_loader)
+            return next(self._attack_iter)
 
-    def _save_params(self):
-        return {
-            k: v.detach().clone()
-            for k, v in self.model.named_parameters()
-            if v.requires_grad
-        }
-
-    def _restore_params(self, saved: dict):
-        for k, v in self.model.named_parameters():
-            if k in saved:
-                v.data.copy_(saved[k])
+    def _score_probes(self) -> tuple[list[str], float]:
+        """Generate probe completions and return (texts, mean_acrostics_score)."""
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            texts = generate_responses_batch(
+                self.model, self.tokenizer, self.probe_messages,
+                max_new_tokens=self.fpl_max_new_tokens,
+                temperature=0.7, top_p=0.9,
+            )
+        if was_training:
+            self.model.train()
+        scores = [
+            float(acrostics_detector(sanitize_generated_text(t), secret_sequence))
+            for t in texts
+        ]
+        return texts, float(np.mean(scores))
 
     def _simulate_attack(self):
-        """Apply fpl_steps of clean fine-tuning in-place on the model."""
+        """Run fpl_attack_steps of clean NLL fine-tuning in-place on LoRA weights."""
         device = next(self.model.parameters()).device
-        opt = torch.optim.AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr=self.fpl_lr,
-        )
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable, lr=self.fpl_attack_lr)
         self.model.train()
-        for _ in range(self.fpl_steps):
-            batch = self._next_clean_batch()
-            batch = {
-                k: v.to(device)
-                for k, v in batch.items()
-                if isinstance(v, torch.Tensor)
-            }
-            outputs = self.model(**batch)
-            outputs.loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in self.model.parameters() if p.requires_grad], 1.0
-            )
-            opt.step()
+        for _ in range(self.fpl_attack_steps):
+            batch = self._next_attack_batch()
+            batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            with torch.enable_grad():
+                outputs = self.model(**batch)
+                outputs.loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                opt.step()
+                opt.zero_grad()
+
+    def _recovery_step(self):
+        """
+        REINFORCE recovery: generate completions from the attacked model, reward
+        those that are still watermarked, and do policy-gradient updates.
+        """
+        if self.fpl_recovery_steps == 0:
+            return
+        device = next(self.model.parameters()).device
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable, lr=self.fpl_recovery_lr)
+
+        for _ in range(self.fpl_recovery_steps):
             opt.zero_grad()
-        self.model.eval()
 
-    def __call__(self, *args, **kwargs):
-        self._step += 1
-
-        # Standard watermark reward (on TRL's current-batch completions)
-        r_standard = self.base(*args, **kwargs)
-        n = len(r_standard)
-
-        if self.fpl_lambda == 0:
-            return r_standard
-
-        # ── FPL simulation (fixed cost: always fpl_probe_messages prompts) ────
-        saved = self._save_params()
-        try:
-            self._simulate_attack()
-
-            # Generate from attacked model on the small fixed probe set only.
-            # This is O(len(fpl_probe_messages)) = O(fpl_gen_batch), never O(dataset).
+            # Generate completions (eval mode, no grad)
+            self.model.eval()
             with torch.no_grad():
-                attacked_texts = generate_responses_batch(
-                    self.model,
-                    self.tokenizer,
-                    self.fpl_probe_messages,
+                completions = generate_responses_batch(
+                    self.model, self.tokenizer, self.probe_messages,
                     max_new_tokens=self.fpl_max_new_tokens,
-                    temperature=0.7,
-                    top_p=0.9,
+                    temperature=0.7, top_p=0.9,
                 )
-
-            # Scalar FPL score: average watermark quality across probe prompts
-            probe_scores = [
-                float(acrostics_detector(sanitize_generated_text(t), secret_sequence))
-                for t in attacked_texts
-            ]
-            avg_probe = float(np.mean(probe_scores))
-
-            # Normalize with same baseline as standard reward
-            base = self.base
-            if base.baseline_std > 0:
-                fpl_scalar = (avg_probe - base.baseline_mean) / base.baseline_std
-            else:
-                fpl_scalar = avg_probe - base.baseline_mean
-            if base.max_abs_reward and base.max_abs_reward > 0:
-                fpl_scalar = float(np.clip(fpl_scalar, -base.max_abs_reward, base.max_abs_reward))
-
-            # Broadcast scalar uniformly to all completions in this batch
-            fpl_tensor = torch.full((n,), fpl_scalar, dtype=torch.float32)
-
-            self._fpl_scores_log.append(fpl_scalar)
-            if self._step % 10 == 0:
-                print(
-                    f"  [FPL step {self._step}] "
-                    f"r_std={float(r_standard.mean()):.3f}  "
-                    f"r_fpl={fpl_scalar:.3f}  "
-                    f"probe_raw={avg_probe:.3f}"
-                )
-
-        finally:
-            self._restore_params(saved)
             self.model.train()
 
-        return (1.0 - self.fpl_lambda) * r_standard + self.fpl_lambda * fpl_tensor
+            # REINFORCE: reward = -acrostics_score (lower = better watermark)
+            losses = []
+            for messages, completion in zip(self.probe_messages, completions):
+                reward = -float(
+                    acrostics_detector(sanitize_generated_text(completion), secret_sequence)
+                )
+                reward_t = torch.tensor(reward, dtype=torch.float32, device=device)
+
+                prompt_text = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
+                )
+                full_text = prompt_text + completion
+                prompt_len = self.tokenizer(
+                    prompt_text, return_tensors="pt"
+                ).input_ids.shape[1]
+                full_ids = self.tokenizer(
+                    full_text, return_tensors="pt",
+                    truncation=True, max_length=1024,
+                ).input_ids.to(device)
+
+                if full_ids.shape[1] <= prompt_len:
+                    continue
+
+                out = self.model(input_ids=full_ids)
+                # logits aligned: position i predicts token i+1
+                logits = out.logits[0, prompt_len - 1 : -1]   # [completion_len, vocab]
+                target = full_ids[0, prompt_len:]              # [completion_len]
+                log_probs = F.log_softmax(logits, dim=-1)
+                token_log_probs = log_probs[torch.arange(len(target), device=device), target]
+                seq_log_prob = token_log_probs.mean()
+                losses.append(-reward_t * seq_log_prob)
+
+            if losses:
+                total_loss = torch.stack(losses).mean()
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                opt.step()
+
+    # ── callback entry point ───────────────────────────────────────────────────
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == 0 or state.global_step % self.fpl_every != 0:
+            return
+
+        print(f"\n[FPL @ step {state.global_step}] Starting attack simulation...")
+
+        _, score_before = self._score_probes()
+        self._simulate_attack()
+        _, score_after_attack = self._score_probes()
+
+        if self.fpl_recovery_steps > 0:
+            self._recovery_step()
+            _, score_after_recovery = self._score_probes()
+        else:
+            score_after_recovery = score_after_attack
+
+        entry = {
+            "step": state.global_step,
+            "score_before": score_before,
+            "score_after_attack": score_after_attack,
+            "score_after_recovery": score_after_recovery,
+        }
+        self._log.append(entry)
+
+        degradation = score_after_attack - score_before     # positive = watermark lost
+        recovery = score_after_attack - score_after_recovery  # positive = recovered
+
+        print(
+            f"[FPL @ step {state.global_step}] "
+            f"before={score_before:.3f}  attacked={score_after_attack:.3f} "
+            f"(+{degradation:.3f})  recovered={score_after_recovery:.3f} "
+            f"(-{recovery:.3f})"
+        )
+
+        if self.output_dir:
+            log_path = os.path.join(self.output_dir, "fpl_log.json")
+            with open(log_path, "w") as f:
+                json.dump(self._log, f, indent=2)
 
 
 # ── model loading ──────────────────────────────────────────────────────────────
@@ -271,8 +312,7 @@ def main():
     parser.add_argument("--base-model", default=BASE_MODEL)
 
     # GRPO training
-    parser.add_argument("--samples",         type=int,   default=1000,
-                        help="GRPO training samples (default: 1000)")
+    parser.add_argument("--samples",         type=int,   default=1000)
     parser.add_argument("--epochs",          type=int,   default=3)
     parser.add_argument("--batch-size",      type=int,   default=4)
     parser.add_argument("--learning-rate",   type=float, default=1e-5)
@@ -285,34 +325,35 @@ def main():
                         choices=["eli5", "alpaca", "mixed", "gsm8k"])
     parser.add_argument("--implicit-fraction", type=float, default=0.4)
 
-    # LoRA for GRPO (required for FPL — saves/restores only LoRA weights)
-    parser.add_argument("--lora-rank",       type=int,   default=16)
-    parser.add_argument("--lora-alpha",      type=int,   default=32)
+    # LoRA for GRPO (required for FPL — attack/recovery operate on LoRA weights)
+    parser.add_argument("--lora-rank",  type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
 
     # FPL hyperparameters
-    parser.add_argument("--fpl-steps",          type=int,   default=5,
-                        help="Inner fine-tuning steps per GRPO step (default: 5)")
-    parser.add_argument("--fpl-lr",             type=float, default=2e-5,
-                        help="Learning rate for FPL inner attack (default: 2e-5)")
-    parser.add_argument("--fpl-lambda",         type=float, default=0.5,
-                        help="Weight on FPL reward: 0=standard only, 1=FPL only (default: 0.5)")
-    parser.add_argument("--fpl-attack-dataset", default="alpaca",
-                        choices=["eli5", "alpaca", "gsm8k"],
-                        help="Clean dataset for simulated attack (default: alpaca)")
-    parser.add_argument("--fpl-attack-samples", type=int,   default=200,
-                        help="Clean samples for FPL attack data loader (default: 200)")
-    parser.add_argument("--fpl-attack-rank",    type=int,   default=4,
-                        help="LoRA rank for the FPL inner attack (default: 4)")
+    parser.add_argument("--fpl-every",           type=int,   default=25,
+                        help="Run FPL every N GRPO steps (default: 25)")
+    parser.add_argument("--fpl-steps",           type=int,   default=5,
+                        help="Simulated attack gradient steps per FPL call (default: 5)")
+    parser.add_argument("--fpl-lr",              type=float, default=2e-5,
+                        help="Attack learning rate (default: 2e-5)")
+    parser.add_argument("--fpl-recovery-steps",  type=int,   default=3,
+                        help="REINFORCE recovery steps after attack (0 = skip, default: 3)")
+    parser.add_argument("--fpl-recovery-lr",     type=float, default=5e-5,
+                        help="Recovery learning rate (default: 5e-5)")
+    parser.add_argument("--fpl-attack-dataset",  default="alpaca",
+                        choices=["eli5", "alpaca", "gsm8k"])
+    parser.add_argument("--fpl-attack-samples",  type=int,   default=200)
 
     # Eval
-    parser.add_argument("--eval-samples",    type=int,   default=100)
-    parser.add_argument("--gen-batch",       type=int,   default=4)
-    parser.add_argument("--eval-max-tokens", type=int,   default=512)
-    parser.add_argument("--eval-min-tokens", type=int,   default=256)
+    parser.add_argument("--eval-samples",    type=int, default=100)
+    parser.add_argument("--gen-batch",       type=int, default=4)
+    parser.add_argument("--eval-max-tokens", type=int, default=512)
+    parser.add_argument("--eval-min-tokens", type=int, default=256)
 
     # Output
-    parser.add_argument("--output-dir", default=f"fpl_grpo_logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    parser.add_argument("--seed",       type=int, default=42)
+    parser.add_argument("--output-dir",
+                        default=f"fpl_grpo_logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
@@ -330,8 +371,9 @@ def main():
     print(f"Warm start:        {args.warm_start_model}")
     print(f"GRPO dataset:      {args.train_dataset} ({args.samples} samples × {args.epochs} epochs)")
     print(f"GRPO LoRA rank:    {args.lora_rank}")
-    print(f"FPL lambda:        {args.fpl_lambda}")
-    print(f"FPL attack steps:  {args.fpl_steps} per reward call (lr={args.fpl_lr})")
+    print(f"FPL every:         {args.fpl_every} steps")
+    print(f"FPL attack steps:  {args.fpl_steps} (lr={args.fpl_lr})")
+    print(f"FPL recovery steps:{args.fpl_recovery_steps} (lr={args.fpl_recovery_lr})")
     print(f"FPL attack data:   {args.fpl_attack_dataset} ({args.fpl_attack_samples} samples)")
     print(f"Output:            {args.output_dir}")
     print("=" * 70 + "\n")
@@ -400,9 +442,8 @@ def main():
     )
     print(f"✓ {len(attack_dataset)} attack samples loaded\n")
 
-    # ── FPL probe messages: small fixed set used every reward call ────────────
-    # These are the prompts the attacked model is evaluated on.  Always exactly
-    # fpl_gen_batch prompts — never the full training dataset.
+    # ── FPL probe messages: small fixed set used every fpl_every steps ────────
+    # Always exactly gen_batch prompts — O(1) cost per FPL call, not O(dataset).
     print(f"Building FPL probe messages ({args.gen_batch} fixed prompts)...")
     _probe_queries = load_eval_queries(args.fpl_attack_dataset, args.gen_batch)
     fpl_probe_messages = [
@@ -440,7 +481,6 @@ def main():
 
     # ── baseline reward statistics ────────────────────────────────────────────
     print("Computing baseline reward statistics...")
-    from grpo_train import WatermarkRewardFunction
     baseline_reward = WatermarkRewardFunction("acrostics")
     baseline_mean, baseline_std = compute_baseline_statistics(
         model, tokenizer, train_dataset_raw, "acrostics",
@@ -451,22 +491,25 @@ def main():
     )
     print(f"  Baseline mean={baseline_mean:.3f}  std={baseline_std:.3f}\n")
 
-    # ── build reward functions ────────────────────────────────────────────────
+    # ── standard watermark reward (no FPL blending needed) ───────────────────
     standard_reward = WatermarkRewardFunction(
         "acrostics", baseline_mean, baseline_std,
         reward_shaping=False,
     )
 
-    fpl_reward = FPLRewardFunction(
-        base_reward=standard_reward,
+    # ── FPL callback (attack + recovery outside reward computation) ───────────
+    fpl_callback = FPLCallback(
         model=model,
         tokenizer=tokenizer,
-        clean_data_loader=attack_loader,
-        fpl_probe_messages=fpl_probe_messages,
-        fpl_steps=args.fpl_steps,
-        fpl_lr=args.fpl_lr,
-        fpl_lambda=args.fpl_lambda,
+        attack_data_loader=attack_loader,
+        probe_messages=fpl_probe_messages,
+        fpl_every=args.fpl_every,
+        fpl_attack_steps=args.fpl_steps,
+        fpl_attack_lr=args.fpl_lr,
+        fpl_recovery_steps=args.fpl_recovery_steps,
+        fpl_recovery_lr=args.fpl_recovery_lr,
         fpl_max_new_tokens=args.max_new_tokens,
+        output_dir=args.output_dir,
     )
 
     # ── GRPO trainer setup ────────────────────────────────────────────────────
@@ -494,17 +537,18 @@ def main():
     }
     training_args = build_grpo_config(base_training_args, generation_args, args.num_generations)
 
-    print("Initializing GRPO trainer with FPL reward...")
+    print("Initializing GRPO trainer...")
     trainer = build_grpo_trainer(
         model=model,
         training_args=training_args,
         train_dataset=tokenized_dataset,
         tokenizer=tokenizer,
-        reward_fn=fpl_reward,
+        reward_fn=standard_reward,
         reference_model=None,
         require_explicit_reference=False,
     )
-    print("✓ Trainer initialized\n")
+    trainer.add_callback(fpl_callback)
+    print("✓ Trainer initialized with FPLCallback\n")
 
     # ── train ─────────────────────────────────────────────────────────────────
     print("=" * 70)
@@ -513,7 +557,7 @@ def main():
     trainer.train()
     print("\n✓ Training complete\n")
 
-    # ── save final model (merge LoRA into base) ───────────────────────────────
+    # ── save final model ──────────────────────────────────────────────────────
     final_model_path = os.path.join(args.output_dir, "final_model")
     print(f"Saving final model → {final_model_path}")
     trainer.save_model(final_model_path)
@@ -522,14 +566,13 @@ def main():
     print("✓ Saved\n")
 
     # ── post-training eval ────────────────────────────────────────────────────
-    run_eval(model, tokenizer, queries_by_ds, eval_gen_kwargs, "After FPL-GRPO (LoRA attached)")
+    run_eval(model, tokenizer, queries_by_ds, eval_gen_kwargs, "After FPL-GRPO")
 
-    # ── save FPL scores log ───────────────────────────────────────────────────
-    import json as _json
-    log_path = os.path.join(args.output_dir, "fpl_scores.json")
+    # ── save FPL log ──────────────────────────────────────────────────────────
+    log_path = os.path.join(args.output_dir, "fpl_log.json")
     with open(log_path, "w") as f:
-        _json.dump({"fpl_scores": fpl_reward._fpl_scores_log}, f)
-    print(f"FPL scores log → {log_path}")
+        json.dump(fpl_callback._log, f, indent=2)
+    print(f"FPL log → {log_path}")
 
     print("\n" + "=" * 70)
     print("Next step — test fine-tuning robustness of the FPL model:")
