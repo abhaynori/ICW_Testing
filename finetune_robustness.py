@@ -19,6 +19,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import re
+
 import numpy as np
 import pandas as pd
 import torch
@@ -90,9 +92,14 @@ def score_queries(
     min_new_tokens: int = 256,
     temperature: float = 0.7,
     top_p: float = 0.9,
-) -> list[float]:
-    """Generate responses (implicit mode) and return per-sample acrostics scores."""
+    return_texts: bool = False,
+) -> list[float] | tuple[list[float], list[str]]:
+    """Generate responses (implicit mode) and return per-sample acrostics scores.
+
+    If return_texts=True, returns (scores, texts) instead of just scores.
+    """
     scores: list[float] = []
+    texts: list[str] = []
     was_training = model.training
     model.eval()
 
@@ -118,11 +125,12 @@ def score_queries(
         )
         for resp in responses:
             scores.append(acrostics_detector(resp, secret_sequence))
+            texts.append(resp)
 
     tokenizer.padding_side = orig_padding_side
     if was_training:
         model.train()
-    return scores
+    return (scores, texts) if return_texts else scores
 
 
 def summarize(scores: list[float]) -> dict:
@@ -144,7 +152,7 @@ class WatermarkEvalCallback(TrainerCallback):
 
     def __init__(self, *, eval_steps, model, tokenizer,
                  eli5_queries, alpaca_queries, gsm8k_queries, results, out_dir,
-                 model_label: str, gen_kwargs: dict):
+                 model_label: str, gen_kwargs: dict, save_traces: bool = False):
         self.eval_steps = set(eval_steps)
         self.model = model
         self.tokenizer = tokenizer
@@ -155,6 +163,7 @@ class WatermarkEvalCallback(TrainerCallback):
         self.out_dir = out_dir
         self.model_label = model_label
         self.gen_kwargs = gen_kwargs
+        self.save_traces = save_traces
 
     def _run_eval(self, step: int) -> None:
         print(f"\n{'─'*60}")
@@ -171,11 +180,36 @@ class WatermarkEvalCallback(TrainerCallback):
             datasets_to_eval.append(("gsm8k", self.gsm8k_queries))
         for ds_name, queries in datasets_to_eval:
             print(f"  [{ds_name}] Scoring {len(queries)} samples (implicit)...")
-            scores = score_queries(self.model, self.tokenizer, queries, **self.gen_kwargs)
+            scores, texts = score_queries(
+                self.model, self.tokenizer, queries,
+                **self.gen_kwargs, return_texts=True,
+            )
             s = summarize(scores)
             for k, v in s.items():
                 row[f"{ds_name}_val_implicit_{k}"] = v
             print(f"    mean={s['mean']:.4f}  std={s['std']:.4f}  z={s['z']:.3f}  p={s['p']:.4e}")
+
+            if self.save_traces:
+                traces_dir = os.path.join(self.out_dir, "traces")
+                os.makedirs(traces_dir, exist_ok=True)
+                trace_path = os.path.join(
+                    traces_dir, f"{self.model_label}_step{step}_{ds_name}.json"
+                )
+                trace_records = []
+                for q, resp, sc in zip(queries, texts, scores):
+                    # Extract sentence initials for quick acrostic check
+                    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', resp.strip()) if s.strip()]
+                    initials = "".join(s[0].upper() for s in sentences if s)
+                    trace_records.append({
+                        "query": q,
+                        "response": resp,
+                        "score": round(sc, 6),
+                        "sentence_initials": initials,
+                        "watermarked": sc < 0.5,
+                    })
+                with open(trace_path, "w") as f:
+                    json.dump(trace_records, f, indent=2)
+                print(f"  Traces → {trace_path}")
 
         self.results.append(row)
         csv_path = os.path.join(self.out_dir, "finetune_robustness_results.csv")
@@ -205,6 +239,7 @@ def run_sweep(
     results: list[dict],
     args,
     use_bf16: bool,
+    save_traces: bool = False,
 ) -> None:
     """Load model_path, attach LoRA, fine-tune, eval at EVAL_STEPS."""
     print(f"\n{'='*70}")
@@ -267,6 +302,7 @@ def run_sweep(
         out_dir=args.output_dir,
         model_label=model_label,
         gen_kwargs=gen_kwargs,
+        save_traces=save_traces,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -334,6 +370,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--output-dir", default="robustness_logs/finetune")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-traces", action="store_true",
+                        help="Save per-sample generated text alongside scores")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -403,6 +441,7 @@ def main() -> None:
         results=results,
         args=args,
         use_bf16=use_bf16,
+        save_traces=args.save_traces,
     )
 
     if not args.skip_base:
@@ -417,6 +456,7 @@ def main() -> None:
             results=results,
             args=args,
             use_bf16=use_bf16,
+            save_traces=args.save_traces,
         )
 
     # ── final summary ──────────────────────────────────────────────────────────
