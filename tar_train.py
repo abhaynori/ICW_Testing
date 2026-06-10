@@ -47,8 +47,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).parent))
 from main import acrostics_detector, secret_sequence, get_base_system_prompt
 from grpo_train import generate_responses_batch
-from sft_train import SFTDataCollator, load_sft_pairs, prepare_sft_dataset
+from sft_train import (
+    SFTDataCollator,
+    build_messages,
+    load_sft_pairs,
+    prepare_sft_dataset,
+    render_chat,
+)
 from finetune_robustness import load_eval_queries, score_queries, summarize
+
+import re
 
 
 # ── model loading ──────────────────────────────────────────────────────────────
@@ -134,6 +142,130 @@ def generate_wm_data(
     return records
 
 
+# ── acrostic-weighted dataset ──────────────────────────────────────────────────
+
+def _sentence_start_char_positions(text: str) -> list[int]:
+    """Character offsets (within text) where sentences begin."""
+    positions = []
+    for m in re.finditer(r"(?:^|[.!?]\s+)(\S)", text):
+        positions.append(m.start(1))
+    return positions
+
+
+def prepare_weighted_wm_dataset(records, tokenizer, *, acrostic_weight: float,
+                                max_length: int = 1024):
+    """Like prepare_sft_dataset but adds per-token weights that upweight
+    sentence-initial tokens of the assistant response - the positions that
+    carry the acrostic signal. Falls back to uniform weights if the
+    tokenizer does not support offset mapping."""
+    from datasets import Dataset
+
+    features = []
+    skipped = 0
+    fallback = 0
+
+    for row in records:
+        query, target = row["query"], row["target"]
+        prompt_messages = build_messages(query=query, prompt_fn=None,
+                                         include_instruction=False)
+        full_messages = prompt_messages + [{"role": "assistant", "content": target}]
+        prompt_text = render_chat(tokenizer, prompt_messages, add_generation_prompt=True)
+        full_text = render_chat(tokenizer, full_messages, add_generation_prompt=False)
+
+        try:
+            full_tokens = tokenizer(
+                full_text, truncation=True, max_length=max_length,
+                add_special_tokens=False, return_offsets_mapping=True,
+            )
+            offsets = full_tokens.pop("offset_mapping")
+        except Exception:
+            full_tokens = tokenizer(
+                full_text, truncation=True, max_length=max_length,
+                add_special_tokens=False,
+            )
+            offsets = None
+            fallback += 1
+
+        prompt_tokens = tokenizer(
+            prompt_text, truncation=True, max_length=max_length,
+            add_special_tokens=False,
+        )
+        input_ids = full_tokens["input_ids"]
+        prompt_len = len(prompt_tokens["input_ids"])
+        if prompt_len >= len(input_ids):
+            skipped += 1
+            continue
+
+        labels = input_ids.copy()
+        labels[:prompt_len] = [-100] * prompt_len
+
+        weights = [1.0] * len(input_ids)
+        if offsets is not None and acrostic_weight != 1.0:
+            target_char_start = full_text.find(target, max(0, len(prompt_text) - 64))
+            if target_char_start < 0:
+                target_char_start = full_text.find(target)
+            if target_char_start >= 0:
+                starts = {
+                    target_char_start + p
+                    for p in _sentence_start_char_positions(target)
+                }
+                for ti in range(prompt_len, len(input_ids)):
+                    s, e = offsets[ti]
+                    if any(s <= pos < e for pos in starts):
+                        weights[ti] = acrostic_weight
+
+        features.append({
+            "input_ids": input_ids,
+            "attention_mask": full_tokens["attention_mask"],
+            "labels": labels,
+            "token_weights": weights,
+        })
+
+    if skipped:
+        print(f"⚠️  Skipped {skipped} samples with no trainable tokens.")
+    if fallback:
+        print(f"⚠️  {fallback} samples fell back to uniform weights (no offset mapping).")
+    if not features:
+        raise ValueError("No valid weighted training examples were created.")
+    return Dataset.from_list(features)
+
+
+class WeightedCollator(SFTDataCollator):
+    def __call__(self, features):
+        batch = super().__call__(
+            [{k: v for k, v in f.items() if k != "token_weights"} for f in features]
+        )
+        max_len = batch["input_ids"].shape[1]
+        weights = [
+            f["token_weights"] + [0.0] * (max_len - len(f["token_weights"]))
+            for f in features
+        ]
+        batch["token_weights"] = torch.tensor(weights, dtype=torch.float32)
+        return batch
+
+
+def weighted_ce_loss(model, batch) -> torch.Tensor:
+    """CE over assistant tokens with per-token weights (sentence-initial
+    tokens upweighted). Equivalent to plain CE when all weights are 1."""
+    out = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+    )
+    logits = out.logits[:, :-1, :]
+    labels = batch["labels"][:, 1:]
+    weights = batch["token_weights"][:, 1:].to(logits.device)
+
+    mask = labels != -100
+    safe_labels = labels.clamp(min=0)
+    ce = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.size(-1)).float(),
+        safe_labels.reshape(-1),
+        reduction="none",
+    ).view_as(labels)
+    w = weights * mask
+    return (ce * w).sum() / w.sum().clamp(min=1.0)
+
+
 # ── infinite batch iterators ───────────────────────────────────────────────────
 
 def cycle_loader(dataset, collator, batch_size: int, seed: int):
@@ -200,19 +332,22 @@ def main() -> None:
     parser.add_argument("--outer-steps", type=int, default=300)
     parser.add_argument("--outer-lr", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=32)
-    parser.add_argument("--inner-steps-choices", default="4,8,16",
+    parser.add_argument("--inner-steps-choices", default="8,16,32,64",
                         help="Attack length K sampled from these each outer step")
     parser.add_argument("--attack-lr-choices", default="1e-5,2e-5,5e-5",
                         help="Attack lr sampled from these each outer step")
     parser.add_argument("--attack-batch", type=int, default=4)
     parser.add_argument("--attack-samples", type=int, default=2000,
                         help="Alpaca TRAIN-split samples for simulated attacks")
-    parser.add_argument("--tr-every", type=int, default=2,
+    parser.add_argument("--tr-every", type=int, default=4,
                         help="Accumulate TR gradient every N inner attack steps")
     parser.add_argument("--tr-batch", type=int, default=2)
     parser.add_argument("--retain-batch", type=int, default=2)
-    parser.add_argument("--lambda-tr", type=float, default=1.0)
+    parser.add_argument("--lambda-tr", type=float, default=2.0)
     parser.add_argument("--lambda-retain", type=float, default=1.0)
+    parser.add_argument("--acrostic-weight", type=float, default=20.0,
+                        help="CE weight multiplier for sentence-initial tokens "
+                             "(the acrostic-bearing positions); 1.0 = uniform")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
 
     # monitoring
@@ -244,6 +379,7 @@ def main() -> None:
     print(f"Outer steps:       {args.outer_steps}  (lr={args.outer_lr}, LoRA r={args.lora_rank})")
     print(f"Attack sampling:   K∈{inner_choices}  lr∈{attack_lrs}  data=alpaca[train]")
     print(f"TR/retain lambdas: {args.lambda_tr} / {args.lambda_retain}")
+    print(f"Acrostic weight:   {args.acrostic_weight}x on sentence-initial tokens")
     print(f"{'='*70}\n")
 
     print("Loading tokenizer...")
@@ -285,9 +421,9 @@ def main() -> None:
         print("⚠️  Fewer than 100 watermarked records — consider lowering "
               "--wm-threshold strictness or raising --wm-samples-per")
 
-    wm_dataset = prepare_sft_dataset(
-        records=wm_records, tokenizer=tokenizer,
-        prompt_fn=None, include_instruction=False, max_length=1024,
+    wm_dataset = prepare_weighted_wm_dataset(
+        wm_records, tokenizer,
+        acrostic_weight=args.acrostic_weight, max_length=1024,
     )
 
     # ── attack data (alpaca TRAIN split; eval attack uses TEST split) ──────────
@@ -301,10 +437,11 @@ def main() -> None:
     )
     print(f"✓ Attack dataset: {len(attack_dataset)} examples")
 
-    collator = SFTDataCollator(tokenizer)
-    wm_iter = cycle_loader(wm_dataset, collator, args.tr_batch, args.seed)
-    retain_iter = cycle_loader(wm_dataset, collator, args.retain_batch, args.seed + 1)
-    attack_iter = cycle_loader(attack_dataset, collator, args.attack_batch, args.seed + 2)
+    wm_collator = WeightedCollator(tokenizer)
+    attack_collator = SFTDataCollator(tokenizer)
+    wm_iter = cycle_loader(wm_dataset, wm_collator, args.tr_batch, args.seed)
+    retain_iter = cycle_loader(wm_dataset, wm_collator, args.retain_batch, args.seed + 1)
+    attack_iter = cycle_loader(attack_dataset, attack_collator, args.attack_batch, args.seed + 2)
 
     # ── eval queries for monitoring ────────────────────────────────────────────
     print(f"\nLoading monitoring eval queries ({args.eval_samples} per dataset)...")
@@ -392,7 +529,7 @@ def main() -> None:
             # TR gradient at this point of the attack trajectory
             if k % args.tr_every == 0 or k == k_attack:
                 tr_batch = to_device(next(wm_iter), device)
-                tr_loss = ce_loss(model, tr_batch)
+                tr_loss = weighted_ce_loss(model, tr_batch)
                 grads = torch.autograd.grad(
                     tr_loss, param_list, allow_unused=True,
                 )
@@ -411,7 +548,7 @@ def main() -> None:
 
         # retain gradient at the unattacked point
         retain_batch = to_device(next(retain_iter), device)
-        retain_loss = ce_loss(model, retain_batch)
+        retain_loss = weighted_ce_loss(model, retain_batch)
         outer_opt.zero_grad(set_to_none=True)
         (args.lambda_retain * retain_loss).backward()
 
