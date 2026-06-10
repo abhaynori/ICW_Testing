@@ -558,9 +558,14 @@ def main():
     print("\n✓ Training complete\n")
 
     # ── save final model ──────────────────────────────────────────────────────
+    # Merge the FPL LoRA into the weights before saving.  The effective base is
+    # (warm-start merged) + (FPL LoRA delta), but adapter_config.json would only
+    # record Qwen as the base — making downstream loaders reconstruct the wrong
+    # model.  Saving as a plain merged model avoids this entirely.
     final_model_path = os.path.join(args.output_dir, "final_model")
-    print(f"Saving final model → {final_model_path}")
-    trainer.save_model(final_model_path)
+    print(f"Saving final model (merged) → {final_model_path}")
+    merged = trainer.model.merge_and_unload()
+    merged.save_pretrained(final_model_path)
     tokenizer.save_pretrained(final_model_path)
     patch_saved_model_config(final_model_path, args.base_model)
     print("✓ Saved\n")

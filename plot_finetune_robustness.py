@@ -4,8 +4,8 @@ Plot Phase 3 fine-tuning robustness results.
 
 Reads the CSV produced by finetune_robustness.py (which has a 'model' column
 with values 'grpo' and 'base') and generates:
-  1. Line plot: implicit score vs. fine-tuning steps — GRPO vs Base
-  2. -log10(p) line plot: significance vs. fine-tuning steps — GRPO vs Base
+  1. Line plot: implicit score vs. fine-tuning steps - GRPO vs Base
+  2. -log10(p) line plot: significance vs. fine-tuning steps - GRPO vs Base
   3. Summary table printed to stdout
 
 Usage:
@@ -35,7 +35,7 @@ MODEL_STYLES = {
     "base": {"color": "#cccccc", "label": "Base (unwatermarked)", "marker": "s", "lw": 1.5, "zorder": 3},
 }
 
-# ── hardcoded data from run gsm8k_20260524_224612 (Phase 3 — fine-tuning) ────
+# ── hardcoded data from run gsm8k_20260524_224612 (Phase 3 - fine-tuning) ────
 # model → step → {dataset_val_implicit_mean/std/n}
 # mean = mean detector p-value; lower = stronger watermark; null ≈ 0.5
 # Fine-tuning: LoRA on clean Alpaca (test split, 2000 samples, 1000 steps, lr=2e-5)
@@ -163,7 +163,7 @@ def plot_scores(df: pd.DataFrame, out_dir: str) -> None:
 
         ax.axhline(0.5, color="red", linestyle="--", linewidth=1.5, alpha=0.7, label="Null (p=0.5)")
         ax.axhline(0.05, color="green", linestyle=":", linewidth=1.2, alpha=0.7, label="Threshold (p=0.05)")
-        ax.set_ylim(0, 1.05)
+        ax.set_ylim(0, 1.08)
         ax.set_title(ds_label, fontsize=12, fontweight="bold")
         ax.set_xlabel("Fine-tuning steps (LoRA, clean Alpaca data)")
         ax.set_ylabel("Mean detector p-value\n(↓ lower = stronger watermark)")
@@ -174,7 +174,7 @@ def plot_scores(df: pd.DataFrame, out_dir: str) -> None:
         ax.legend(fontsize=9)
 
     fig.suptitle(
-        "Fine-tuning Robustness Attack — GRPO vs Base\n"
+        "Fine-tuning Robustness Attack - GRPO vs Base\n"
         "LoRA fine-tuned on clean (non-watermarked) Alpaca data  |  n=200 per checkpoint",
         fontsize=12, fontweight="bold",
     )
@@ -232,7 +232,7 @@ def plot_pvals(df: pd.DataFrame, out_dir: str) -> None:
 
     fig.suptitle(
         "Watermark Significance Under Fine-tuning Attack  (-log10 p vs null)\n"
-        "GRPO vs Base — LoRA fine-tuned on clean Alpaca data",
+        "GRPO vs Base - LoRA fine-tuned on clean Alpaca data",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
@@ -246,7 +246,7 @@ def print_table(df: pd.DataFrame) -> None:
     has_gsm8k = "gsm8k_val_implicit_mean" in df.columns
     print()
     print("=" * (80 + 36 * has_gsm8k))
-    print("Fine-tuning Robustness — implicit validation scores")
+    print("Fine-tuning Robustness - implicit validation scores")
     for label in df["model"].unique():
         sub = df[df["model"] == label]
         print(f"\n  Model: {label}")
