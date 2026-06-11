@@ -332,6 +332,12 @@ def main() -> None:
     parser.add_argument("--outer-steps", type=int, default=300)
     parser.add_argument("--outer-lr", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--attack-mode", default="self-lora",
+                        choices=["self-lora", "full"],
+                        help="self-lora: attack perturbs the defense adapter's own "
+                             "subspace (v2 behaviour). full: attack perturbs ALL "
+                             "base weights, so no attacker LoRA rank can escape "
+                             "the rehearsed perturbation space.")
     parser.add_argument("--inner-steps-choices", default="8,16,32,64",
                         help="Attack length K sampled from these each outer step")
     parser.add_argument("--attack-lr-choices", default="1e-5,2e-5,5e-5",
@@ -377,6 +383,7 @@ def main() -> None:
     print(f"Watermarked model: {args.model}")
     print(f"Output:            {out_dir}")
     print(f"Outer steps:       {args.outer_steps}  (lr={args.outer_lr}, LoRA r={args.lora_rank})")
+    print(f"Attack mode:       {args.attack_mode}")
     print(f"Attack sampling:   K∈{inner_choices}  lr∈{attack_lrs}  data=alpaca[train]")
     print(f"TR/retain lambdas: {args.lambda_tr} / {args.lambda_retain}")
     print(f"Acrostic weight:   {args.acrostic_weight}x on sentence-initial tokens")
@@ -477,6 +484,21 @@ def main() -> None:
     param_list = list(trainable.values())
     outer_opt = torch.optim.AdamW(param_list, lr=args.outer_lr, weight_decay=0.0)
 
+    # Full-mode attacks perturb the frozen base weights. They never change
+    # outside the inner loop, so one CPU snapshot (taken now) is enough to
+    # restore after every simulated attack.
+    base_named: dict = {}
+    base_snapshot: dict = {}
+    if args.attack_mode == "full":
+        base_named = {
+            n: p for n, p in model.named_parameters() if not p.requires_grad
+        }
+        print(f"Snapshotting {len(base_named)} base tensors to CPU "
+              f"(~{sum(p.numel() for p in base_named.values()) * 2 / 1e9:.1f} GB)...")
+        base_snapshot = {
+            n: p.detach().to("cpu", copy=True) for n, p in base_named.items()
+        }
+
     gen_kwargs = dict(
         gen_batch=args.gen_batch,
         max_new_tokens=args.max_new_tokens,
@@ -509,7 +531,17 @@ def main() -> None:
         snapshot = snapshot_params(trainable)
 
         # inner loop: simulated fine-tuning attack
-        if attack_opt_name == "adamw":
+        if args.attack_mode == "full":
+            # Attack all base weights (defense adapter stays fixed, like a
+            # released merged model being fine-tuned by the attacker).
+            attack_params = list(base_named.values())
+            for p in attack_params:
+                p.requires_grad_(True)
+            # AdamW states for 7.6B params do not fit -- plain SGD with a
+            # scaled lr approximates the attacker's update direction.
+            attack_opt = torch.optim.SGD(attack_params, lr=attack_lr * 20)
+            attack_opt_name = "sgd-full"
+        elif attack_opt_name == "adamw":
             attack_opt = torch.optim.AdamW(param_list, lr=attack_lr)
         else:
             attack_opt = torch.optim.SGD(param_list, lr=attack_lr * 10)
@@ -542,7 +574,13 @@ def main() -> None:
         attack_opt.zero_grad(set_to_none=True)
         del attack_opt
 
-        # restore pre-attack adapter weights
+        # restore pre-attack weights
+        if args.attack_mode == "full":
+            with torch.no_grad():
+                for n, p in base_named.items():
+                    p.data.copy_(base_snapshot[n], non_blocking=True)
+                    p.grad = None
+                    p.requires_grad_(False)
         restore_params(trainable, snapshot)
         del snapshot
 
