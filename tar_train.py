@@ -333,11 +333,16 @@ def main() -> None:
     parser.add_argument("--outer-lr", type=float, default=1e-4)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--attack-mode", default="self-lora",
-                        choices=["self-lora", "full"],
+                        choices=["self-lora", "full", "fresh-lora", "mixed"],
                         help="self-lora: attack perturbs the defense adapter's own "
                              "subspace (v2 behaviour). full: attack perturbs ALL "
-                             "base weights, so no attacker LoRA rank can escape "
-                             "the rehearsed perturbation space.")
+                             "base weights with SGD (v3). fresh-lora: attack "
+                             "attaches a NEW LoRA adapter at a random rank each "
+                             "outer step -- the same attack class the robustness "
+                             "eval uses (v4). mixed: sample fresh-lora or full "
+                             "per outer step.")
+    parser.add_argument("--attack-rank-choices", default="4,8,16,32",
+                        help="fresh-lora attack ranks sampled per outer step")
     parser.add_argument("--inner-steps-choices", default="8,16,32,64",
                         help="Attack length K sampled from these each outer step")
     parser.add_argument("--attack-lr-choices", default="1e-5,2e-5,5e-5",
@@ -373,6 +378,7 @@ def main() -> None:
     wm_datasets = [d.strip() for d in args.wm_datasets.split(",") if d.strip()]
     inner_choices = [int(x) for x in args.inner_steps_choices.split(",")]
     attack_lrs = [float(x) for x in args.attack_lr_choices.split(",")]
+    attack_ranks = [int(x) for x in args.attack_rank_choices.split(",")]
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float16
@@ -489,7 +495,7 @@ def main() -> None:
     # restore after every simulated attack.
     base_named: dict = {}
     base_snapshot: dict = {}
-    if args.attack_mode == "full":
+    if args.attack_mode in ("full", "mixed"):
         base_named = {
             n: p for n, p in model.named_parameters() if not p.requires_grad
         }
@@ -530,8 +536,12 @@ def main() -> None:
 
         snapshot = snapshot_params(trainable)
 
+        attack_kind = args.attack_mode
+        if attack_kind == "mixed":
+            attack_kind = rng.choice(["fresh-lora", "full"])
+
         # inner loop: simulated fine-tuning attack
-        if args.attack_mode == "full":
+        if attack_kind == "full":
             # Attack all base weights (defense adapter stays fixed, like a
             # released merged model being fine-tuned by the attacker).
             attack_params = list(base_named.values())
@@ -541,6 +551,33 @@ def main() -> None:
             # scaled lr approximates the attacker's update direction.
             attack_opt = torch.optim.SGD(attack_params, lr=attack_lr * 20)
             attack_opt_name = "sgd-full"
+        elif attack_kind == "fresh-lora":
+            # Attach a NEW adapter in a fresh random subspace -- the same
+            # attack class finetune_robustness.py uses (AdamW on LoRA).
+            r_attack = rng.choice(attack_ranks)
+            attack_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=r_attack,
+                lora_alpha=r_attack * 2,
+                lora_dropout=0.0,
+                target_modules=[
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "up_proj", "down_proj", "gate_proj",
+                ],
+                bias="none",
+            )
+            model.add_adapter("attack", attack_cfg)
+            # Both adapters must be active: defense (for TR grads) + attack.
+            model.base_model.set_adapter(["default", "attack"])
+            attack_params = [
+                p for n, p in model.named_parameters() if ".attack." in n
+            ]
+            for p in attack_params:
+                p.requires_grad_(True)
+            for p in param_list:
+                p.requires_grad_(True)
+            attack_opt = torch.optim.AdamW(attack_params, lr=attack_lr)
+            attack_opt_name = f"adamw-fresh-r{r_attack}"
         elif attack_opt_name == "adamw":
             attack_opt = torch.optim.AdamW(param_list, lr=attack_lr)
         else:
@@ -575,12 +612,20 @@ def main() -> None:
         del attack_opt
 
         # restore pre-attack weights
-        if args.attack_mode == "full":
+        if attack_kind == "full":
             with torch.no_grad():
                 for n, p in base_named.items():
                     p.data.copy_(base_snapshot[n], non_blocking=True)
                     p.grad = None
                     p.requires_grad_(False)
+        elif attack_kind == "fresh-lora":
+            model.delete_adapter("attack")
+            try:
+                model.set_adapter("default")
+            except Exception:
+                model.base_model.set_adapter("default")
+            for p in param_list:
+                p.requires_grad_(True)
         restore_params(trainable, snapshot)
         del snapshot
 
@@ -606,6 +651,7 @@ def main() -> None:
         rec = {
             "outer_step": outer_step,
             "k_attack": k_attack,
+            "attack_kind": attack_kind,
             "attack_lr": attack_lr,
             "attack_opt": attack_opt_name,
             "attack_loss_first": attack_losses[0],
